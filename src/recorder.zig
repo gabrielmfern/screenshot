@@ -52,33 +52,8 @@ pub const Recorder = struct {
         _ = self.child.wait() catch {};
     }
 
-    /// Copy the recorded video to the clipboard via wl-copy.
-    pub fn copyToClipboard(self: *Recorder) !void {
-        var child = std.process.Child.init(
-            &.{ "wl-copy", "--type", "video/mp4" },
-            self.allocator,
-        );
-        child.stdin_behavior = .Pipe;
-        child.stdout_behavior = .Ignore;
-        child.stderr_behavior = .Ignore;
-        try child.spawn();
-
-        const file = try std.fs.cwd().openFile(self.output_path, .{});
-        defer file.close();
-
-        const data = try file.readToEndAlloc(self.allocator, 512 * 1024 * 1024);
-        defer self.allocator.free(data);
-
-        if (child.stdin) |stdin| {
-            var f = stdin;
-            f.writeAll(data) catch {};
-            f.close();
-            child.stdin = null;
-        }
-
-        _ = child.wait() catch {};
-
-        // Clean up temp file
-        std.fs.deleteFileAbsolute(self.output_path) catch {};
+    /// Returns the path to the recorded file. Caller should copy it to clipboard.
+    pub fn getOutputPath(self: *const Recorder) [:0]const u8 {
+        return self.output_path;
     }
 };

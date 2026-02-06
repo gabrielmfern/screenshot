@@ -634,6 +634,7 @@ pub const Overlay = struct {
     pub const Result = struct {
         selection: ?Rect,
         action: Action,
+        serial: u32,
     };
 
     pub fn run(self: *Overlay) !Result {
@@ -645,6 +646,7 @@ pub const Overlay = struct {
         return .{
             .selection = self.selection,
             .action = self.action,
+            .serial = self.pointer_serial,
         };
     }
 

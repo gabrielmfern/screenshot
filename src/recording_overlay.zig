@@ -553,12 +553,20 @@ pub const RecordingOverlay = struct {
         }
     }
 
-    pub fn run(self: *RecordingOverlay) !RecordAction {
+    pub const RunResult = struct {
+        action: RecordAction,
+        serial: u32,
+    };
+
+    pub fn run(self: *RecordingOverlay) !RunResult {
         while (!self.done) {
             if (wl.c.wl_display_dispatch(self.display) == -1)
                 return error.WaylandDispatchFailed;
         }
-        return self.action;
+        return .{
+            .action = self.action,
+            .serial = self.pointer_serial,
+        };
     }
 
     pub fn deinit(self: *RecordingOverlay) void {
@@ -581,7 +589,8 @@ fn recFrameCallback(data: ?*anyopaque, cb: ?*wl.c.wl_callback, _: u32) callconv(
     wl.c.wl_callback_destroy(cb);
     self.frame_pending = false;
 
-    // Always redraw (timer ticks every second, continuous redraw keeps it updating)
+    if (self.done) return;
+
     self.needs_redraw = false;
     self.renderToBuffer();
     self.commitBuffer();

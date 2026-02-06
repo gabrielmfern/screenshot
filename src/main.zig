@@ -8,6 +8,7 @@ const CaptureState = @import("capture.zig").CaptureState;
 const Overlay = @import("overlay.zig").Overlay;
 const Recorder = @import("recorder.zig").Recorder;
 const RecordingOverlay = @import("recording_overlay.zig").RecordingOverlay;
+const Clipboard = @import("clipboard.zig").Clipboard;
 
 // ── Timer ────────────────────────────────────────────────────────────────────
 
@@ -36,6 +37,7 @@ var layer_shell: ?*wl.c.zwlr_layer_shell_v1 = null;
 var capture_manager: ?*wl.c.ext_image_copy_capture_manager_v1 = null;
 var source_manager: ?*wl.c.ext_output_image_capture_source_manager_v1 = null;
 var screencopy_manager: ?*wl.c.zwlr_screencopy_manager_v1 = null;
+var data_device_manager: ?*wl.c.wl_data_device_manager = null;
 
 // ── Registry listener ───────────────────────────────────────────────────────
 
@@ -79,6 +81,7 @@ fn registryGlobal(
     const capture_mgr_info = BindingInfo(wl.c.ext_image_copy_capture_manager_v1).new(&wl.c.ext_image_copy_capture_manager_v1_interface, 1);
     const source_mgr_info = BindingInfo(wl.c.ext_output_image_capture_source_manager_v1).new(&wl.c.ext_output_image_capture_source_manager_v1_interface, 1);
     const screencopy_info = BindingInfo(wl.c.zwlr_screencopy_manager_v1).new(&wl.c.zwlr_screencopy_manager_v1_interface, 3);
+    const ddm_info = BindingInfo(wl.c.wl_data_device_manager).new(&wl.c.wl_data_device_manager_interface, 3);
 
     if (compositor_info.is(iface)) {
         wl_compositor = compositor_info.bind(registry, name);
@@ -99,6 +102,8 @@ fn registryGlobal(
         source_manager = source_mgr_info.bind(registry, name);
     } else if (screencopy_info.is(iface)) {
         screencopy_manager = screencopy_info.bind(registry, name);
+    } else if (ddm_info.is(iface)) {
+        data_device_manager = ddm_info.bind(registry, name);
     }
 }
 
@@ -166,32 +171,29 @@ fn generateOutputPath(allocator: std.mem.Allocator, width: u32, height: u32) ![:
     );
 }
 
-/// Copy a PNG file to the Wayland clipboard via wl-copy.
-fn copyToClipboard(allocator: std.mem.Allocator, png_path: [:0]const u8) !void {
-    var child = std.process.Child.init(
-        &.{ "wl-copy", "--type", "image/png" },
-        allocator,
-    );
-    child.stdin_behavior = .Pipe;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    try child.spawn();
-
-    // Read the PNG file and write it to wl-copy's stdin
-    const file = try std.fs.cwd().openFile(png_path, .{});
+/// Copy file data to the Wayland clipboard natively via wl_data_device_manager.
+/// Forks a background process that serves clipboard requests until cancelled.
+/// After this returns, the parent must NOT disconnect the Wayland display
+/// (the child process needs the connection to serve paste requests).
+fn copyFileToClipboard(allocator: std.mem.Allocator, path: [:0]const u8, mime_type: [*:0]const u8, serial: u32) !void {
+    const file = try std.fs.cwd().openFile(path, .{});
     defer file.close();
 
-    const png_data = try file.readToEndAlloc(allocator, 64 * 1024 * 1024);
-    defer allocator.free(png_data);
+    // After fork(), the child has its own copy-on-write pages, so the
+    // parent can safely free its copy.
+    const file_data = try file.readToEndAlloc(allocator, 512 * 1024 * 1024);
+    defer allocator.free(file_data);
 
-    if (child.stdin) |stdin| {
-        var f = stdin;
-        f.writeAll(png_data) catch {};
-        f.close();
-        child.stdin = null;
-    }
+    try copyDataToClipboard(mime_type, file_data, serial);
+}
 
-    _ = child.wait() catch {};
+fn copyDataToClipboard(mime_type: [*:0]const u8, data: []const u8, serial: u32) !void {
+    const clipboard = Clipboard{
+        .data_device_manager = data_device_manager orelse return error.MissingDataDeviceManager,
+        .seat = wl_seat orelse return error.MissingSeat,
+        .display = wl_display orelse return error.NoWaylandDisplay,
+    };
+    try clipboard.copyAndDetach(mime_type, data, serial);
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
@@ -252,7 +254,9 @@ pub fn main() !void {
         std.log.err("failed to connect to Wayland display", .{});
         return error.NoWaylandDisplay;
     };
-    defer wl.c.wl_display_disconnect(wl_display);
+    // NOTE: no defer disconnect here. If we fork a clipboard daemon,
+    // the child inherits the fd and we must not close it in the parent.
+    // Cleanup is done explicitly at the end, or skipped if clipboard was set.
 
     wl_registry = wl.c.wl_display_get_registry(wl_display) orelse
         return error.FailedToGetRegistry;
@@ -304,6 +308,7 @@ pub fn main() !void {
 
     var action: Overlay.Action = .save_to_file; // default for fullscreen mode
     var result_selection: ?Rect = null; // raw selection rect for recording
+    var last_serial: u32 = 0; // serial from last input event (needed for clipboard)
 
     if (mode == .region) {
         if (wl_seat == null) return error.MissingSeat;
@@ -325,6 +330,7 @@ pub fn main() !void {
 
         const result = try overlay.run();
         action = result.action;
+        last_serial = result.serial;
 
         // Dismiss the overlay immediately so the user sees it disappear
         // before the save/copy work begins.
@@ -347,14 +353,15 @@ pub fn main() !void {
 
     // Step 3: Execute the chosen action
     var save_target: *Image = if (cropped_image) |*img| img else &screenshot;
+    var clipboard_forked = false;
 
     switch (action) {
         .copy_to_clipboard => {
             const timer = Timer.start();
-            // Save to a temp file, then pipe to wl-copy
             const tmp_path = "/tmp/screenshot-clipboard.png";
             try save_target.savePng(tmp_path);
-            try copyToClipboard(allocator, tmp_path);
+            try copyFileToClipboard(allocator, tmp_path, "image/png", last_serial);
+            clipboard_forked = true;
             std.fs.deleteFileAbsolute(tmp_path) catch {};
             std.log.info("copied to clipboard in {d:.1}ms", .{timer.elapsedMs()});
         },
@@ -395,10 +402,12 @@ pub fn main() !void {
 
             // Run the recording overlay event loop
             // It returns when the user clicks pause or stop
+            var rec_serial: u32 = last_serial;
             while (true) {
-                const rec_action = try rec_overlay.run();
+                const rec_result = try rec_overlay.run();
+                rec_serial = rec_result.serial;
 
-                switch (rec_action) {
+                switch (rec_result.action) {
                     .pause => {
                         recorder.togglePause();
                         // Reset and continue the loop
@@ -417,10 +426,12 @@ pub fn main() !void {
 
             // Stop wf-recorder and copy to clipboard
             recorder.stop();
-            recorder.copyToClipboard() catch |err| {
+            copyFileToClipboard(allocator, recorder.getOutputPath(), "video/mp4", rec_serial) catch |err| {
                 std.log.err("failed to copy recording to clipboard: {}", .{err});
                 return;
             };
+            clipboard_forked = true;
+            std.fs.deleteFileAbsolute(recorder.getOutputPath()) catch {};
             std.log.info("recording copied to clipboard", .{});
         },
         .cancel => unreachable, // handled above
@@ -430,7 +441,15 @@ pub fn main() !void {
         },
     }
 
-    // Cleanup globals
+    if (clipboard_forked) {
+        // A child process is serving clipboard on our Wayland connection.
+        // We must NOT disconnect/destroy anything — just exit quietly.
+        // The child will exit when the clipboard is replaced.
+        return;
+    }
+
+    // Cleanup globals (only when no clipboard daemon is running)
+    if (data_device_manager) |m| wl.c.wl_data_device_manager_destroy(m);
     if (layer_shell) |ls| wl.c.zwlr_layer_shell_v1_destroy(ls);
     if (capture_manager) |cm| wl.c.ext_image_copy_capture_manager_v1_destroy(cm);
     if (source_manager) |sm| wl.c.ext_output_image_capture_source_manager_v1_destroy(sm);
@@ -438,6 +457,7 @@ pub fn main() !void {
     if (wl_seat) |s| wl.c.wl_seat_destroy(s);
     wl.c.wl_shm_destroy(wl_shm.?);
     wl.c.wl_compositor_destroy(wl_compositor.?);
+    wl.c.wl_display_disconnect(wl_display);
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -470,4 +490,5 @@ comptime {
     _ = @import("image.zig");
     _ = @import("recorder.zig");
     _ = @import("recording_overlay.zig");
+    _ = @import("clipboard.zig");
 }
