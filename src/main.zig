@@ -94,7 +94,37 @@ const registry_listener: wl.c.wl_registry_listener = .{
 
 // ── Output path generation ──────────────────────────────────────────────────
 
+fn getPicturesDir(allocator: std.mem.Allocator) ![]const u8 {
+    var child = std.process.Child.init(&.{ "xdg-user-dir", "PICTURES" }, allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+    child.spawn() catch return error.XdgUserDirFailed;
+
+    var buf: [4096]u8 = undefined;
+    const n = if (child.stdout) |stdout|
+        stdout.readAll(&buf) catch 0
+    else
+        0;
+    _ = child.wait() catch {};
+
+    if (n > 0) {
+        const trimmed = std.mem.trimRight(u8, buf[0..n], "\n\r");
+        if (trimmed.len > 0) {
+            return try allocator.dupe(u8, trimmed);
+        }
+    }
+    return error.XdgUserDirFailed;
+}
+
+fn getFallbackPicturesDir(allocator: std.mem.Allocator) ![]const u8 {
+    const home = posix.getenv("HOME") orelse return error.NoHomeDir;
+    return try allocator.dupe(u8, home);
+}
+
 fn generateOutputPath(allocator: std.mem.Allocator, width: u32, height: u32) ![:0]u8 {
+    const pictures_dir = getPicturesDir(allocator) catch try getFallbackPicturesDir(allocator);
+    defer allocator.free(pictures_dir);
+
     const timestamp = std.time.timestamp();
     const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = @intCast(timestamp) };
     const day_seconds = epoch_seconds.getDaySeconds();
@@ -103,8 +133,9 @@ fn generateOutputPath(allocator: std.mem.Allocator, width: u32, height: u32) ![:
 
     return std.fmt.allocPrintSentinel(
         allocator,
-        "screenshot-{d}x{d}-{d}-{d:0>2}-{d:0>2}_{d:0>2}{d:0>2}{d:0>2}.png",
+        "{s}/screenshot-{d}x{d}-{d}-{d:0>2}-{d:0>2}_{d:0>2}{d:0>2}{d:0>2}.png",
         .{
+            pictures_dir,
             width,
             height,
             year_day.year,
@@ -337,9 +368,10 @@ test "generateOutputPath produces valid filename with resolution and date" {
     const path = try generateOutputPath(allocator, 1920, 1080);
     defer allocator.free(path);
 
-    try std.testing.expect(std.mem.startsWith(u8, path, "screenshot-1920x1080-"));
+    // Should end with .png and contain the resolution
     try std.testing.expect(std.mem.endsWith(u8, path, ".png"));
-    // Should contain underscores separating date from time
+    try std.testing.expect(std.mem.indexOf(u8, path, "screenshot-1920x1080-") != null);
+    // Should contain underscore separating date from time
     try std.testing.expect(std.mem.indexOf(u8, path, "_") != null);
 }
 
@@ -347,11 +379,11 @@ test "generateOutputPath different resolutions" {
     const allocator = std.testing.allocator;
     const p1 = try generateOutputPath(allocator, 2560, 1440);
     defer allocator.free(p1);
-    try std.testing.expect(std.mem.startsWith(u8, p1, "screenshot-2560x1440-"));
+    try std.testing.expect(std.mem.indexOf(u8, p1, "screenshot-2560x1440-") != null);
 
     const p2 = try generateOutputPath(allocator, 800, 600);
     defer allocator.free(p2);
-    try std.testing.expect(std.mem.startsWith(u8, p2, "screenshot-800x600-"));
+    try std.testing.expect(std.mem.indexOf(u8, p2, "screenshot-800x600-") != null);
 }
 
 // Pull in tests from all modules
