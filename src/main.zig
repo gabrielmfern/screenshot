@@ -37,7 +37,7 @@ var layer_shell: ?*wl.c.zwlr_layer_shell_v1 = null;
 var capture_manager: ?*wl.c.ext_image_copy_capture_manager_v1 = null;
 var source_manager: ?*wl.c.ext_output_image_capture_source_manager_v1 = null;
 var screencopy_manager: ?*wl.c.zwlr_screencopy_manager_v1 = null;
-var data_device_manager: ?*wl.c.wl_data_device_manager = null;
+var data_control_manager: ?*wl.c.ext_data_control_manager_v1 = null;
 
 // ── Registry listener ───────────────────────────────────────────────────────
 
@@ -81,7 +81,7 @@ fn registryGlobal(
     const capture_mgr_info = BindingInfo(wl.c.ext_image_copy_capture_manager_v1).new(&wl.c.ext_image_copy_capture_manager_v1_interface, 1);
     const source_mgr_info = BindingInfo(wl.c.ext_output_image_capture_source_manager_v1).new(&wl.c.ext_output_image_capture_source_manager_v1_interface, 1);
     const screencopy_info = BindingInfo(wl.c.zwlr_screencopy_manager_v1).new(&wl.c.zwlr_screencopy_manager_v1_interface, 3);
-    const ddm_info = BindingInfo(wl.c.wl_data_device_manager).new(&wl.c.wl_data_device_manager_interface, 3);
+    const data_control_info = BindingInfo(wl.c.ext_data_control_manager_v1).new(&wl.c.ext_data_control_manager_v1_interface, 1);
 
     if (compositor_info.is(iface)) {
         wl_compositor = compositor_info.bind(registry, name);
@@ -102,8 +102,8 @@ fn registryGlobal(
         source_manager = source_mgr_info.bind(registry, name);
     } else if (screencopy_info.is(iface)) {
         screencopy_manager = screencopy_info.bind(registry, name);
-    } else if (ddm_info.is(iface)) {
-        data_device_manager = ddm_info.bind(registry, name);
+    } else if (data_control_info.is(iface)) {
+        data_control_manager = data_control_info.bind(registry, name);
     }
 }
 
@@ -171,11 +171,59 @@ fn generateOutputPath(allocator: std.mem.Allocator, width: u32, height: u32) ![:
     );
 }
 
-/// Copy file data to the Wayland clipboard natively via wl_data_device_manager.
+fn generateRecordingPath(allocator: std.mem.Allocator) ![:0]u8 {
+    const videos_dir = getVideosDir(allocator) catch try getFallbackPicturesDir(allocator);
+    defer allocator.free(videos_dir);
+
+    const timestamp = std.time.timestamp();
+    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = @intCast(timestamp) };
+    const day_seconds = epoch_seconds.getDaySeconds();
+    const year_day = epoch_seconds.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+
+    return std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/recording-{d}-{d:0>2}-{d:0>2}_{d:0>2}{d:0>2}{d:0>2}.mp4",
+        .{
+            videos_dir,
+            year_day.year,
+            month_day.month.numeric(),
+            month_day.day_index + 1,
+            day_seconds.getHoursIntoDay(),
+            day_seconds.getMinutesIntoHour(),
+            day_seconds.getSecondsIntoMinute(),
+        },
+        0,
+    );
+}
+
+fn getVideosDir(allocator: std.mem.Allocator) ![]const u8 {
+    var child = std.process.Child.init(&.{ "xdg-user-dir", "VIDEOS" }, allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+    child.spawn() catch return error.XdgUserDirFailed;
+
+    var buf: [4096]u8 = undefined;
+    const n = if (child.stdout) |stdout|
+        stdout.readAll(&buf) catch 0
+    else
+        0;
+    _ = child.wait() catch {};
+
+    if (n > 0) {
+        const trimmed = std.mem.trimRight(u8, buf[0..n], "\n\r");
+        if (trimmed.len > 0) {
+            return try allocator.dupe(u8, trimmed);
+        }
+    }
+    return error.XdgUserDirFailed;
+}
+
+/// Copy file data to the Wayland clipboard natively via ext-data-control-v1.
 /// Forks a background process that serves clipboard requests until cancelled.
 /// After this returns, the parent must NOT disconnect the Wayland display
 /// (the child process needs the connection to serve paste requests).
-fn copyFileToClipboard(allocator: std.mem.Allocator, path: [:0]const u8, mime_type: [*:0]const u8, serial: u32) !void {
+fn copyFileToClipboard(allocator: std.mem.Allocator, path: [:0]const u8, mime_type: [*:0]const u8) !void {
     const file = try std.fs.cwd().openFile(path, .{});
     defer file.close();
 
@@ -184,16 +232,16 @@ fn copyFileToClipboard(allocator: std.mem.Allocator, path: [:0]const u8, mime_ty
     const file_data = try file.readToEndAlloc(allocator, 512 * 1024 * 1024);
     defer allocator.free(file_data);
 
-    try copyDataToClipboard(mime_type, file_data, serial);
+    try copyDataToClipboard(mime_type, file_data);
 }
 
-fn copyDataToClipboard(mime_type: [*:0]const u8, data: []const u8, serial: u32) !void {
+fn copyDataToClipboard(mime_type: [*:0]const u8, data: []const u8) !void {
     const clipboard = Clipboard{
-        .data_device_manager = data_device_manager orelse return error.MissingDataDeviceManager,
+        .data_control_manager = data_control_manager orelse return error.MissingDataControlManager,
         .seat = wl_seat orelse return error.MissingSeat,
         .display = wl_display orelse return error.NoWaylandDisplay,
     };
-    try clipboard.copyAndDetach(mime_type, data, serial);
+    try clipboard.copy(mime_type, data);
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
@@ -308,7 +356,6 @@ pub fn main() !void {
 
     var action: Overlay.Action = .save_to_file; // default for fullscreen mode
     var result_selection: ?Rect = null; // raw selection rect for recording
-    var last_serial: u32 = 0; // serial from last input event (needed for clipboard)
 
     if (mode == .region) {
         if (wl_seat == null) return error.MissingSeat;
@@ -330,7 +377,6 @@ pub fn main() !void {
 
         const result = try overlay.run();
         action = result.action;
-        last_serial = result.serial;
 
         // Dismiss the overlay immediately so the user sees it disappear
         // before the save/copy work begins.
@@ -360,7 +406,7 @@ pub fn main() !void {
             const timer = Timer.start();
             const tmp_path = "/tmp/screenshot-clipboard.png";
             try save_target.savePng(tmp_path);
-            try copyFileToClipboard(allocator, tmp_path, "image/png", last_serial);
+            try copyFileToClipboard(allocator, tmp_path, "image/png");
             clipboard_forked = true;
             std.fs.deleteFileAbsolute(tmp_path) catch {};
             std.log.info("copied to clipboard in {d:.1}ms", .{timer.elapsedMs()});
@@ -402,10 +448,8 @@ pub fn main() !void {
 
             // Run the recording overlay event loop
             // It returns when the user clicks pause or stop
-            var rec_serial: u32 = last_serial;
             while (true) {
                 const rec_result = try rec_overlay.run();
-                rec_serial = rec_result.serial;
 
                 switch (rec_result.action) {
                     .pause => {
@@ -424,15 +468,35 @@ pub fn main() !void {
             rec_overlay.deinit();
             _ = wl.c.wl_display_flush(wl_display);
 
-            // Stop wf-recorder and copy to clipboard
+            // Stop wf-recorder
             recorder.stop();
-            copyFileToClipboard(allocator, recorder.getOutputPath(), "video/mp4", rec_serial) catch |err| {
+
+            // Move the recording to a permanent location
+            const recording_path = generateRecordingPath(allocator) catch |err| {
+                std.log.err("failed to generate recording path: {}", .{err});
+                return;
+            };
+            defer allocator.free(recording_path);
+
+            std.fs.copyFileAbsolute(recorder.getOutputPath(), recording_path, .{}) catch |err| {
+                std.log.err("failed to move recording: {}", .{err});
+                return;
+            };
+            std.fs.deleteFileAbsolute(recorder.getOutputPath()) catch {};
+
+            // Copy file path to clipboard as text/uri-list
+            const uri = std.fmt.allocPrint(allocator, "file://{s}\r\n", .{recording_path}) catch |err| {
+                std.log.err("failed to format URI: {}", .{err});
+                return;
+            };
+            defer allocator.free(uri);
+
+            copyDataToClipboard("text/uri-list", uri) catch |err| {
                 std.log.err("failed to copy recording to clipboard: {}", .{err});
                 return;
             };
             clipboard_forked = true;
-            std.fs.deleteFileAbsolute(recorder.getOutputPath()) catch {};
-            std.log.info("recording copied to clipboard", .{});
+            std.log.info("recording saved to {s} and copied to clipboard", .{recording_path});
         },
         .cancel => unreachable, // handled above
         .none => {
@@ -449,7 +513,7 @@ pub fn main() !void {
     }
 
     // Cleanup globals (only when no clipboard daemon is running)
-    if (data_device_manager) |m| wl.c.wl_data_device_manager_destroy(m);
+    if (data_control_manager) |m| wl.c.ext_data_control_manager_v1_destroy(m);
     if (layer_shell) |ls| wl.c.zwlr_layer_shell_v1_destroy(ls);
     if (capture_manager) |cm| wl.c.ext_image_copy_capture_manager_v1_destroy(cm);
     if (source_manager) |sm| wl.c.ext_output_image_capture_source_manager_v1_destroy(sm);

@@ -11,6 +11,7 @@ pub const c = @cImport({
     @cInclude("image-copy-capture-client-protocol.h");
     @cInclude("image-capture-source-client-protocol.h");
     @cInclude("foreign-toplevel-list-client-protocol.h");
+    @cInclude("ext-data-control-v1-client-protocol.h");
 
     @cInclude("wlr-layer-shell-unstable-v1-client-protocol.h");
     @cInclude("wlr-screencopy-unstable-v1-client-protocol.h");

@@ -43,6 +43,10 @@ pub fn build(b: *std.Build) void {
             .name = "foreign-toplevel-list",
             .xmlPath = "/usr/share/wayland-protocols/staging/ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1.xml",
         },
+        Protocol{
+            .name = "ext-data-control-v1",
+            .xmlPath = "/usr/share/wayland-protocols/staging/ext-data-control/ext-data-control-v1.xml",
+        },
     };
 
     const allProtocols = waylandProtocols;
