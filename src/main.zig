@@ -354,7 +354,7 @@ pub fn main() !void {
             std.fs.deleteFileAbsolute(tmp_path) catch {};
             std.log.info("copied to clipboard in {d:.1}ms", .{timer.elapsedMs()});
         },
-        .save_to_file => {
+        .save_to_file, .take_screenshot => {
             const timer = Timer.start();
             const owned_path = if (output_path_arg) |p|
                 try allocator.dupeZ(u8, p)
@@ -364,6 +364,9 @@ pub fn main() !void {
 
             try save_target.savePng(owned_path.ptr);
             std.log.info("saved to {s} in {d:.1}ms", .{ owned_path, timer.elapsedMs() });
+        },
+        .record => {
+            std.log.info("recording not yet implemented", .{});
         },
         .cancel => unreachable, // handled above
         .none => {

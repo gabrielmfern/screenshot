@@ -60,6 +60,9 @@ pub const Overlay = struct {
     // Keyboard modifier state
     ctrl_held: bool = false,
 
+    // Toolbar state
+    hovered_button: ?ToolbarButton = null,
+
     // Result
     selection: ?Rect = null,
     action: Action = .none,
@@ -70,7 +73,65 @@ pub const Overlay = struct {
         cancel,
         copy_to_clipboard,
         save_to_file,
+        take_screenshot,
+        record,
     };
+
+    pub const ToolbarButton = enum {
+        screenshot,
+        record,
+    };
+
+    // ── Toolbar layout constants ────────────────────────────────────
+    const button_size: u32 = 48; // square icon buttons
+    const button_spacing: u32 = 12; // gap between buttons
+    const toolbar_gap: u32 = 12; // gap between selection and buttons
+    const button_corner_radius: u32 = 12;
+
+    fn buttonRect(self: *const Overlay, btn: ToolbarButton) ?Rect {
+        const sel = self.selection orelse return null;
+        const total_width: u32 = button_size * 2 + button_spacing;
+        const center_x = sel.x + sel.width / 2;
+        const base_x = if (center_x >= total_width / 2) center_x - total_width / 2 else 0;
+        const clamped_x = @min(base_x, self.surface_width -| total_width);
+
+        const bx = switch (btn) {
+            .screenshot => clamped_x,
+            .record => clamped_x + button_size + button_spacing,
+        };
+
+        // Place below selection, or above if no room
+        const below_y = sel.y + sel.height + toolbar_gap;
+        const by = if (below_y + button_size <= self.surface_height)
+            below_y
+        else if (sel.y >= button_size + toolbar_gap)
+            sel.y - button_size - toolbar_gap
+        else
+            return null;
+
+        return Rect{
+            .x = bx,
+            .y = by,
+            .width = button_size,
+            .height = button_size,
+        };
+    }
+
+    fn hitTestToolbar(self: *const Overlay, px: i32, py: i32) ?ToolbarButton {
+        if (px < 0 or py < 0) return null;
+        const ux: u32 = @intCast(px);
+        const uy: u32 = @intCast(py);
+        inline for (.{ ToolbarButton.screenshot, ToolbarButton.record }) |btn| {
+            if (self.buttonRect(btn)) |br| {
+                if (ux >= br.x and ux < br.x + br.width and
+                    uy >= br.y and uy < br.y + br.height)
+                {
+                    return btn;
+                }
+            }
+        }
+        return null;
+    }
 
     pub fn init(self: *Overlay, allocator: std.mem.Allocator) !void {
         self.allocator = allocator;
@@ -197,6 +258,27 @@ pub const Overlay = struct {
         );
     }
 
+    fn setCursorShape(self: *Overlay, name: [*:0]const u8) void {
+        const theme = self.cursor_theme orelse return;
+        const cursor_sfc = self.cursor_surface orelse return;
+        const cur = wl.c.wl_cursor_theme_get_cursor(theme, name) orelse return;
+        if (cur.*.image_count == 0) return;
+        const image = cur.*.images[0].*;
+        const buffer = wl.c.wl_cursor_image_get_buffer(cur.*.images[0]) orelse return;
+
+        wl.c.wl_surface_attach(cursor_sfc, buffer, 0, 0);
+        wl.c.wl_surface_damage_buffer(cursor_sfc, 0, 0, @intCast(image.width), @intCast(image.height));
+        wl.c.wl_surface_commit(cursor_sfc);
+
+        wl.c.wl_pointer_set_cursor(
+            self.pointer.?,
+            self.pointer_serial,
+            cursor_sfc,
+            @intCast(image.hotspot_x),
+            @intCast(image.hotspot_y),
+        );
+    }
+
     /// Render into the current back buffer.
     /// Strategy: memcpy the pre-rendered dark background, then restore only
     /// the pixels inside the selection to full brightness. O(selection_area)
@@ -254,6 +336,11 @@ pub const Overlay = struct {
         // Draw selection border with handles
         self.drawSelectionBorder(data, stride, clamped);
         self.drawHandles(data, stride, clamped);
+
+        // Draw toolbar below selection (only when selection is locked in, not while dragging)
+        if (!self.selecting and self.selection != null) {
+            self.drawToolbar(data, stride);
+        }
     }
 
     fn commitBuffer(self: *Overlay) void {
@@ -379,6 +466,171 @@ pub const Overlay = struct {
         fillRect(data, stride, max_x -| edge_handle_thick, mid_y -| (evl / 2), edge_handle_thick, evl, sw, sh, 0xFF, 0xFF, 0xFF);
     }
 
+    // ── Toolbar rendering ──────────────────────────────────────────────
+
+    fn blendPixel(data: []u8, stride: u32, px: u32, py: u32, r: u8, g: u8, b: u8, a: u8) void {
+        const bpp = ShmBuffer.bpp;
+        const offset = @as(usize, py) * stride + @as(usize, px) * bpp;
+        if (offset + 3 >= data.len) return;
+
+        const alpha = @as(u16, a);
+        const inv_alpha = 255 - alpha;
+
+        data[offset + 0] = @intCast((@as(u16, b) * alpha + @as(u16, data[offset + 0]) * inv_alpha) / 255);
+        data[offset + 1] = @intCast((@as(u16, g) * alpha + @as(u16, data[offset + 1]) * inv_alpha) / 255);
+        data[offset + 2] = @intCast((@as(u16, r) * alpha + @as(u16, data[offset + 2]) * inv_alpha) / 255);
+        data[offset + 3] = 0xFF;
+    }
+
+    fn fillRoundedRectAlpha(data: []u8, stride: u32, rx: u32, ry: u32, rw: u32, rh: u32, sw: u32, sh: u32, radius: u32, r: u8, g: u8, b: u8, a: u8) void {
+        const x_end = @min(rx + rw, sw);
+        const y_end = @min(ry + rh, sh);
+        if (rx >= x_end or ry >= y_end) return;
+
+        const rad = @min(radius, @min(rw / 2, rh / 2));
+        const irad: i32 = @intCast(rad);
+        const irad_sq = irad * irad;
+
+        for (ry..y_end) |y| {
+            for (rx..x_end) |x| {
+                const lx = @as(i32, @intCast(x)) - @as(i32, @intCast(rx));
+                const ly = @as(i32, @intCast(y)) - @as(i32, @intCast(ry));
+                const iw = @as(i32, @intCast(rw));
+                const ih = @as(i32, @intCast(rh));
+
+                var in_rect = true;
+                if (lx < irad and ly < irad) {
+                    const dx = irad - lx - 1;
+                    const dy = irad - ly - 1;
+                    if (dx * dx + dy * dy > irad_sq) in_rect = false;
+                } else if (lx >= iw - irad and ly < irad) {
+                    const dx = lx - (iw - irad);
+                    const dy = irad - ly - 1;
+                    if (dx * dx + dy * dy > irad_sq) in_rect = false;
+                } else if (lx < irad and ly >= ih - irad) {
+                    const dx = irad - lx - 1;
+                    const dy = ly - (ih - irad);
+                    if (dx * dx + dy * dy > irad_sq) in_rect = false;
+                } else if (lx >= iw - irad and ly >= ih - irad) {
+                    const dx = lx - (iw - irad);
+                    const dy = ly - (ih - irad);
+                    if (dx * dx + dy * dy > irad_sq) in_rect = false;
+                }
+
+                if (in_rect) {
+                    blendPixel(data, stride, @intCast(x), @intCast(y), r, g, b, a);
+                }
+            }
+        }
+    }
+
+    fn drawCircle(data: []u8, stride: u32, cx: i32, cy: i32, radius: i32, sw: u32, sh: u32, r: u8, g: u8, b: u8, thickness: i32) void {
+        const outer_r_sq = radius * radius;
+        const inner_r = radius - thickness;
+        const inner_r_sq = inner_r * inner_r;
+
+        var dy: i32 = -radius;
+        while (dy <= radius) : (dy += 1) {
+            var dx: i32 = -radius;
+            while (dx <= radius) : (dx += 1) {
+                const dist_sq = dx * dx + dy * dy;
+                if (dist_sq <= outer_r_sq and dist_sq >= inner_r_sq) {
+                    const px = cx + dx;
+                    const py = cy + dy;
+                    if (px >= 0 and py >= 0) {
+                        const upx: u32 = @intCast(px);
+                        const upy: u32 = @intCast(py);
+                        if (upx < sw and upy < sh) {
+                            setPixel(data, stride, upx, upy, r, g, b);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn drawFilledCircle(data: []u8, stride: u32, cx: i32, cy: i32, radius: i32, sw: u32, sh: u32, r: u8, g: u8, b: u8) void {
+        const r_sq = radius * radius;
+        var dy: i32 = -radius;
+        while (dy <= radius) : (dy += 1) {
+            var dx: i32 = -radius;
+            while (dx <= radius) : (dx += 1) {
+                if (dx * dx + dy * dy <= r_sq) {
+                    const px = cx + dx;
+                    const py = cy + dy;
+                    if (px >= 0 and py >= 0) {
+                        const upx: u32 = @intCast(px);
+                        const upy: u32 = @intCast(py);
+                        if (upx < sw and upy < sh) {
+                            setPixel(data, stride, upx, upy, r, g, b);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Camera icon: body outline + viewfinder bump + lens circle + inner dot.
+    fn drawCameraIcon(data: []u8, stride: u32, cx: u32, cy: u32, sw: u32, sh: u32) void {
+        const icx: i32 = @intCast(cx);
+        const icy: i32 = @intCast(cy);
+
+        // Camera body outline (22x16)
+        const body_w: u32 = 22;
+        const body_h: u32 = 16;
+        const bx = cx -| (body_w / 2);
+        const by = cy -| (body_h / 2) + 2;
+        const thick: u32 = 2;
+
+        fillRect(data, stride, bx, by, body_w, thick, sw, sh, 0xFF, 0xFF, 0xFF); // top
+        fillRect(data, stride, bx, by + body_h -| thick, body_w, thick, sw, sh, 0xFF, 0xFF, 0xFF); // bottom
+        fillRect(data, stride, bx, by, thick, body_h, sw, sh, 0xFF, 0xFF, 0xFF); // left
+        fillRect(data, stride, bx + body_w -| thick, by, thick, body_h, sw, sh, 0xFF, 0xFF, 0xFF); // right
+
+        // Viewfinder bump on top
+        const bump_w: u32 = 8;
+        const bump_h: u32 = 4;
+        fillRect(data, stride, cx -| (bump_w / 2), by -| bump_h + 1, bump_w, bump_h, sw, sh, 0xFF, 0xFF, 0xFF);
+
+        // Lens circle (ring)
+        drawCircle(data, stride, icx, icy + 2, 5, sw, sh, 0xFF, 0xFF, 0xFF, 2);
+
+        // Inner lens dot
+        drawFilledCircle(data, stride, icx, icy + 2, 1, sw, sh, 0xFF, 0xFF, 0xFF);
+    }
+
+    /// Record icon: filled red circle.
+    fn drawRecordIcon(data: []u8, stride: u32, cx: u32, cy: u32, sw: u32, sh: u32) void {
+        drawFilledCircle(data, stride, @intCast(cx), @intCast(cy), 10, sw, sh, 0xF0, 0x40, 0x40);
+    }
+
+    fn drawToolbar(self: *Overlay, data: []u8, stride: u32) void {
+        if (self.buttonRect(.screenshot) == null) return;
+        const sw = self.surface_width;
+        const sh = self.surface_height;
+
+        inline for (.{ ToolbarButton.screenshot, ToolbarButton.record }) |btn| {
+            if (self.buttonRect(btn)) |br| {
+                const is_hovered = self.hovered_button != null and self.hovered_button.? == btn;
+
+                // Button background
+                if (is_hovered) {
+                    fillRoundedRectAlpha(data, stride, br.x, br.y, br.width, br.height, sw, sh, button_corner_radius, 0x50, 0x50, 0x50, 0xE0);
+                } else {
+                    fillRoundedRectAlpha(data, stride, br.x, br.y, br.width, br.height, sw, sh, button_corner_radius, 0x1E, 0x1E, 0x1E, 0xD8);
+                }
+
+                // Icon centered in button
+                const icon_cx = br.x + br.width / 2;
+                const icon_cy = br.y + br.height / 2;
+                switch (btn) {
+                    .screenshot => drawCameraIcon(data, stride, icon_cx, icon_cy, sw, sh),
+                    .record => drawRecordIcon(data, stride, icon_cx, icon_cy, sw, sh),
+                }
+            }
+        }
+    }
+
     pub const Result = struct {
         selection: ?Rect,
         action: Action,
@@ -472,6 +724,24 @@ fn pointerMotion(data: ?*anyopaque, _: ?*wl.c.wl_pointer, _: u32, sx: wl.c.wl_fi
 
     if (self.selecting) {
         self.scheduleRedraw();
+    } else if (self.selection != null) {
+        // Update toolbar hover state
+        const prev_hovered = self.hovered_button;
+        self.hovered_button = self.hitTestToolbar(self.current_x, self.current_y);
+
+        // Update cursor based on hover
+        if (self.hovered_button != null and prev_hovered == null) {
+            self.setCursorShape("hand2");
+        } else if (self.hovered_button == null and prev_hovered != null) {
+            self.setCursor(self.pointer_serial);
+        }
+
+        if ((self.hovered_button == null) != (prev_hovered == null) or
+            (self.hovered_button != null and prev_hovered != null and
+                @intFromEnum(self.hovered_button.?) != @intFromEnum(prev_hovered.?)))
+        {
+            self.scheduleRedraw();
+        }
     }
 }
 
@@ -481,11 +751,30 @@ fn pointerButton(data: ?*anyopaque, _: ?*wl.c.wl_pointer, _: u32, _: u32, button
 
     if (button == BTN_LEFT) {
         if (state == wl.c.WL_POINTER_BUTTON_STATE_PRESSED) {
+            // Check if clicking a toolbar button
+            if (self.selection != null) {
+                if (self.hitTestToolbar(self.current_x, self.current_y)) |btn| {
+                    switch (btn) {
+                        .screenshot => {
+                            self.action = .take_screenshot;
+                            self.done = true;
+                        },
+                        .record => {
+                            self.action = .record;
+                            self.done = true;
+                        },
+                    }
+                    return;
+                }
+            }
+
             // Start a new selection (even if one already exists)
             self.selecting = true;
             self.selection = null;
+            self.hovered_button = null;
             self.start_x = self.current_x;
             self.start_y = self.current_y;
+            self.setCursor(self.pointer_serial); // restore crosshair
             self.scheduleRedraw();
         } else if (state == wl.c.WL_POINTER_BUTTON_STATE_RELEASED) {
             if (self.selecting) {
@@ -498,10 +787,12 @@ fn pointerButton(data: ?*anyopaque, _: ?*wl.c.wl_pointer, _: u32, _: u32, button
                 );
                 if (!sel.isEmpty()) {
                     // Lock in the selection, but don't finish --
-                    // wait for Ctrl+C / Ctrl+S / Escape
+                    // wait for toolbar button click or Ctrl+C / Ctrl+S / Escape
                     self.selection = sel;
+                    // Check if pointer is now over toolbar
+                    self.hovered_button = self.hitTestToolbar(self.current_x, self.current_y);
                 }
-                // Redraw to show final selection state
+                // Redraw to show final selection state with toolbar
                 self.renderToBuffer();
                 self.commitBuffer();
             }
