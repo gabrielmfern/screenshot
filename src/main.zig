@@ -6,6 +6,8 @@ const Image = @import("image.zig").Image;
 const Rect = @import("image.zig").Rect;
 const CaptureState = @import("capture.zig").CaptureState;
 const Overlay = @import("overlay.zig").Overlay;
+const Recorder = @import("recorder.zig").Recorder;
+const RecordingOverlay = @import("recording_overlay.zig").RecordingOverlay;
 
 // ── Timer ────────────────────────────────────────────────────────────────────
 
@@ -301,6 +303,7 @@ pub fn main() !void {
     defer if (cropped_image) |*img| img.deinit();
 
     var action: Overlay.Action = .save_to_file; // default for fullscreen mode
+    var result_selection: ?Rect = null; // raw selection rect for recording
 
     if (mode == .region) {
         if (wl_seat == null) return error.MissingSeat;
@@ -334,6 +337,7 @@ pub fn main() !void {
         }
 
         if (result.selection) |sel| {
+            result_selection = sel;
             cropped_image = try screenshot.crop(allocator, sel);
         } else {
             std.log.info("no selection made", .{});
@@ -366,7 +370,58 @@ pub fn main() !void {
             std.log.info("saved to {s} in {d:.1}ms", .{ owned_path, timer.elapsedMs() });
         },
         .record => {
-            std.log.info("recording not yet implemented", .{});
+            const sel = result_selection orelse {
+                std.log.info("no selection for recording", .{});
+                return;
+            };
+
+            // Start wf-recorder
+            var recorder = Recorder.start(allocator, sel) catch |err| {
+                std.log.err("failed to start wf-recorder: {} (is wf-recorder installed?)", .{err});
+                return;
+            };
+
+            // Show recording overlay
+            var rec_overlay = RecordingOverlay{
+                .display = wl_display.?,
+                .compositor = wl_compositor.?,
+                .shm = wl_shm.?,
+                .seat = wl_seat.?,
+                .layer_shell = layer_shell.?,
+                .output = wl_output.?,
+                .region = sel,
+            };
+            try rec_overlay.init(allocator);
+
+            // Run the recording overlay event loop
+            // It returns when the user clicks pause or stop
+            while (true) {
+                const rec_action = try rec_overlay.run();
+
+                switch (rec_action) {
+                    .pause => {
+                        recorder.togglePause();
+                        // Reset and continue the loop
+                        rec_overlay.done = false;
+                        rec_overlay.action = .none;
+                    },
+                    .stop => {
+                        break;
+                    },
+                    .none => break,
+                }
+            }
+
+            rec_overlay.deinit();
+            _ = wl.c.wl_display_flush(wl_display);
+
+            // Stop wf-recorder and copy to clipboard
+            recorder.stop();
+            recorder.copyToClipboard() catch |err| {
+                std.log.err("failed to copy recording to clipboard: {}", .{err});
+                return;
+            };
+            std.log.info("recording copied to clipboard", .{});
         },
         .cancel => unreachable, // handled above
         .none => {
@@ -413,4 +468,6 @@ test "generateOutputPath different resolutions" {
 // Pull in tests from all modules
 comptime {
     _ = @import("image.zig");
+    _ = @import("recorder.zig");
+    _ = @import("recording_overlay.zig");
 }
