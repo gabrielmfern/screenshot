@@ -94,9 +94,56 @@ const registry_listener: wl.c.wl_registry_listener = .{
 
 // ── Output path generation ──────────────────────────────────────────────────
 
-fn generateOutputPath(allocator: std.mem.Allocator) ![:0]u8 {
+fn generateOutputPath(allocator: std.mem.Allocator, width: u32, height: u32) ![:0]u8 {
     const timestamp = std.time.timestamp();
-    return std.fmt.allocPrintSentinel(allocator, "screenshot-{d}.png", .{timestamp}, 0);
+    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = @intCast(timestamp) };
+    const day_seconds = epoch_seconds.getDaySeconds();
+    const year_day = epoch_seconds.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+
+    return std.fmt.allocPrintSentinel(
+        allocator,
+        "screenshot-{d}x{d}-{d}-{d:0>2}-{d:0>2}_{d:0>2}{d:0>2}{d:0>2}.png",
+        .{
+            width,
+            height,
+            year_day.year,
+            month_day.month.numeric(),
+            month_day.day_index + 1,
+            day_seconds.getHoursIntoDay(),
+            day_seconds.getMinutesIntoHour(),
+            day_seconds.getSecondsIntoMinute(),
+        },
+        0,
+    );
+}
+
+/// Copy a PNG file to the Wayland clipboard via wl-copy.
+fn copyToClipboard(allocator: std.mem.Allocator, png_path: [:0]const u8) !void {
+    var child = std.process.Child.init(
+        &.{ "wl-copy", "--type", "image/png" },
+        allocator,
+    );
+    child.stdin_behavior = .Pipe;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    try child.spawn();
+
+    // Read the PNG file and write it to wl-copy's stdin
+    const file = try std.fs.cwd().openFile(png_path, .{});
+    defer file.close();
+
+    const png_data = try file.readToEndAlloc(allocator, 64 * 1024 * 1024);
+    defer allocator.free(png_data);
+
+    if (child.stdin) |stdin| {
+        var f = stdin;
+        f.writeAll(png_data) catch {};
+        f.close();
+        child.stdin = null;
+    }
+
+    _ = child.wait() catch {};
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
@@ -137,12 +184,14 @@ pub fn main() !void {
                 \\
                 \\Options:
                 \\  -f, --fullscreen   Capture the entire screen (no region selection)
-                \\  -o, --output PATH  Save screenshot to PATH (default: screenshot-<timestamp>.png)
+                \\  -o, --output PATH  Save screenshot to PATH
                 \\  -h, --help         Show this help message
                 \\
                 \\Controls (region mode):
-                \\  Click and drag to select a region
-                \\  Escape to cancel
+                \\  Click and drag    Select a region (can re-select)
+                \\  Ctrl+C            Copy selection to clipboard
+                \\  Ctrl+S            Save selection to file
+                \\  Escape            Cancel
                 \\
             ;
             _ = posix.write(posix.STDOUT_FILENO, help) catch {};
@@ -201,9 +250,11 @@ pub fn main() !void {
 
     var screenshot = capture.getImage();
 
-    // Step 2: Region selection (unless fullscreen mode)
+    // Step 2: Region selection or fullscreen
     var cropped_image: ?Image = null;
     defer if (cropped_image) |*img| img.deinit();
+
+    var action: Overlay.Action = .save_to_file; // default for fullscreen mode
 
     if (mode == .region) {
         if (wl_seat == null) return error.MissingSeat;
@@ -224,26 +275,50 @@ pub fn main() !void {
         try overlay.init(allocator);
         defer overlay.deinit();
 
-        const selection = try overlay.run();
-        if (selection) |sel| {
+        const result = try overlay.run();
+        action = result.action;
+
+        if (action == .cancel) {
+            std.log.info("cancelled", .{});
+            return;
+        }
+
+        if (result.selection) |sel| {
             cropped_image = try screenshot.crop(allocator, sel);
         } else {
-            std.log.info("selection cancelled", .{});
+            std.log.info("no selection made", .{});
             return;
         }
     }
 
-    // Step 3: Save to file
+    // Step 3: Execute the chosen action
     var save_target: *Image = if (cropped_image) |*img| img else &screenshot;
 
-    const owned_path = if (output_path_arg) |p|
-        try allocator.dupeZ(u8, p)
-    else
-        try generateOutputPath(allocator);
-    defer allocator.free(owned_path);
+    switch (action) {
+        .copy_to_clipboard => {
+            // Save to a temp file, then pipe to wl-copy
+            const tmp_path = "/tmp/screenshot-clipboard.png";
+            try save_target.savePng(tmp_path);
+            try copyToClipboard(allocator, tmp_path);
+            std.fs.deleteFileAbsolute(tmp_path) catch {};
+            std.log.info("copied to clipboard", .{});
+        },
+        .save_to_file => {
+            const owned_path = if (output_path_arg) |p|
+                try allocator.dupeZ(u8, p)
+            else
+                try generateOutputPath(allocator, save_target.width, save_target.height);
+            defer allocator.free(owned_path);
 
-    try save_target.savePng(owned_path.ptr);
-    std.log.info("screenshot saved to {s}", .{owned_path});
+            try save_target.savePng(owned_path.ptr);
+            std.log.info("saved to {s}", .{owned_path});
+        },
+        .cancel => unreachable, // handled above
+        .none => {
+            std.log.info("no action taken", .{});
+            return;
+        },
+    }
 
     // Cleanup globals
     if (layer_shell) |ls| wl.c.zwlr_layer_shell_v1_destroy(ls);
@@ -257,14 +332,26 @@ pub fn main() !void {
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 
-test "generateOutputPath produces valid filename" {
+test "generateOutputPath produces valid filename with resolution and date" {
     const allocator = std.testing.allocator;
-    const path = try generateOutputPath(allocator);
+    const path = try generateOutputPath(allocator, 1920, 1080);
     defer allocator.free(path);
 
-    try std.testing.expect(std.mem.startsWith(u8, path, "screenshot-"));
+    try std.testing.expect(std.mem.startsWith(u8, path, "screenshot-1920x1080-"));
     try std.testing.expect(std.mem.endsWith(u8, path, ".png"));
-    try std.testing.expect(path.len > "screenshot-.png".len);
+    // Should contain underscores separating date from time
+    try std.testing.expect(std.mem.indexOf(u8, path, "_") != null);
+}
+
+test "generateOutputPath different resolutions" {
+    const allocator = std.testing.allocator;
+    const p1 = try generateOutputPath(allocator, 2560, 1440);
+    defer allocator.free(p1);
+    try std.testing.expect(std.mem.startsWith(u8, p1, "screenshot-2560x1440-"));
+
+    const p2 = try generateOutputPath(allocator, 800, 600);
+    defer allocator.free(p2);
+    try std.testing.expect(std.mem.startsWith(u8, p2, "screenshot-800x600-"));
 }
 
 // Pull in tests from all modules

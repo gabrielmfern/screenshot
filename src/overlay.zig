@@ -57,10 +57,20 @@ pub const Overlay = struct {
     // Pointer enter serial
     pointer_serial: u32 = 0,
 
+    // Keyboard modifier state
+    ctrl_held: bool = false,
+
     // Result
     selection: ?Rect = null,
-    cancelled: bool = false,
+    action: Action = .none,
     done: bool = false,
+
+    pub const Action = enum {
+        none,
+        cancel,
+        copy_to_clipboard,
+        save_to_file,
+    };
 
     pub fn init(self: *Overlay, allocator: std.mem.Allocator) !void {
         self.allocator = allocator;
@@ -361,14 +371,21 @@ pub const Overlay = struct {
         fillRect(data, stride, max_x -| edge_handle_thick, mid_y -| (evl / 2), edge_handle_thick, evl, sw, sh, 0xFF, 0xFF, 0xFF);
     }
 
-    pub fn run(self: *Overlay) !?Rect {
-        while (!self.done and !self.cancelled) {
+    pub const Result = struct {
+        selection: ?Rect,
+        action: Action,
+    };
+
+    pub fn run(self: *Overlay) !Result {
+        while (!self.done) {
             if (wl.c.wl_display_dispatch(self.display) == -1)
                 return error.WaylandDispatchFailed;
         }
 
-        if (self.cancelled) return null;
-        return self.selection;
+        return .{
+            .selection = self.selection,
+            .action = self.action,
+        };
     }
 
     pub fn deinit(self: *Overlay) void {
@@ -419,7 +436,7 @@ fn layerSurfaceConfigure(data: ?*anyopaque, surface: ?*wl.c.zwlr_layer_surface_v
 
 fn layerSurfaceClosed(data: ?*anyopaque, _: ?*wl.c.zwlr_layer_surface_v1) callconv(.c) void {
     const self: *Overlay = @ptrCast(@alignCast(data));
-    self.cancelled = true;
+    self.action = .cancel;
     self.done = true;
 }
 
@@ -456,7 +473,9 @@ fn pointerButton(data: ?*anyopaque, _: ?*wl.c.wl_pointer, _: u32, _: u32, button
 
     if (button == BTN_LEFT) {
         if (state == wl.c.WL_POINTER_BUTTON_STATE_PRESSED) {
+            // Start a new selection (even if one already exists)
             self.selecting = true;
+            self.selection = null;
             self.start_x = self.current_x;
             self.start_y = self.current_y;
             self.scheduleRedraw();
@@ -470,12 +489,13 @@ fn pointerButton(data: ?*anyopaque, _: ?*wl.c.wl_pointer, _: u32, _: u32, button
                     self.current_y,
                 );
                 if (!sel.isEmpty()) {
+                    // Lock in the selection, but don't finish --
+                    // wait for Ctrl+C / Ctrl+S / Escape
                     self.selection = sel;
-                    self.done = true;
-                } else {
-                    self.renderToBuffer();
-                    self.commitBuffer();
                 }
+                // Redraw to show final selection state
+                self.renderToBuffer();
+                self.commitBuffer();
             }
         }
     }
@@ -508,13 +528,32 @@ fn kbKey(data: ?*anyopaque, _: ?*wl.c.wl_keyboard, _: u32, _: u32, key: u32, sta
     const self: *Overlay = @ptrCast(@alignCast(data));
     if (state != wl.c.WL_KEYBOARD_KEY_STATE_PRESSED) return;
 
-    if (key == 1) { // KEY_ESC
-        self.cancelled = true;
+    // linux/input-event-codes.h
+    const KEY_ESC = 1;
+    const KEY_C = 46;
+    const KEY_S = 31;
+
+    if (key == KEY_ESC) {
+        self.action = .cancel;
         self.done = true;
+    } else if (self.ctrl_held and key == KEY_C) {
+        if (self.selection != null) {
+            self.action = .copy_to_clipboard;
+            self.done = true;
+        }
+    } else if (self.ctrl_held and key == KEY_S) {
+        if (self.selection != null) {
+            self.action = .save_to_file;
+            self.done = true;
+        }
     }
 }
 
-fn kbModifiers(_: ?*anyopaque, _: ?*wl.c.wl_keyboard, _: u32, _: u32, _: u32, _: u32, _: u32) callconv(.c) void {}
+fn kbModifiers(data: ?*anyopaque, _: ?*wl.c.wl_keyboard, _: u32, mods_depressed: u32, _: u32, _: u32, _: u32) callconv(.c) void {
+    const self: *Overlay = @ptrCast(@alignCast(data));
+    // Bit 2 (0x4) in mods_depressed is typically Ctrl
+    self.ctrl_held = (mods_depressed & 0x4) != 0;
+}
 fn kbRepeatInfo(_: ?*anyopaque, _: ?*wl.c.wl_keyboard, _: i32, _: i32) callconv(.c) void {}
 
 const keyboard_listener: wl.c.wl_keyboard_listener = .{
