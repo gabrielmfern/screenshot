@@ -233,8 +233,9 @@ pub const Overlay = struct {
             }
         }
 
-        // Draw white selection border
+        // Draw selection border with handles
         self.drawSelectionBorder(data, stride, clamped);
+        self.drawHandles(data, stride, clamped);
     }
 
     fn commitBuffer(self: *Overlay) void {
@@ -261,77 +262,103 @@ pub const Overlay = struct {
         }
     }
 
-    fn drawSelectionBorder(self: *Overlay, data: []u8, stride: u32, sel: Rect) void {
-        const border: u32 = 2;
+    fn setPixel(data: []u8, stride: u32, px: u32, py: u32, r: u8, g: u8, b: u8) void {
         const bpp = ShmBuffer.bpp;
+        const offset = @as(usize, py) * stride + @as(usize, px) * bpp;
+        if (offset + 3 < data.len) {
+            data[offset + 0] = b;
+            data[offset + 1] = g;
+            data[offset + 2] = r;
+            data[offset + 3] = 0xFF;
+        }
+    }
 
-        const max_x = @min(sel.x + sel.width, self.surface_width);
-        const max_y = @min(sel.y + sel.height, self.surface_height);
+    fn fillRect(data: []u8, stride: u32, rx: u32, ry: u32, rw: u32, rh: u32, sw: u32, sh: u32, r: u8, g: u8, b: u8) void {
+        const x_end = @min(rx + rw, sw);
+        const y_end = @min(ry + rh, sh);
+        if (rx >= x_end or ry >= y_end) return;
 
-        // Horizontal borders (top + bottom) -- write full rows for speed
-        for (0..border) |d| {
-            // Top row
-            const top_y = sel.y + @as(u32, @intCast(d));
-            if (top_y < self.surface_height) {
-                var offset = top_y * stride + sel.x * bpp;
-                for (sel.x..max_x) |_| {
-                    if (offset + 3 < data.len) {
-                        data[offset] = 0xFF;
-                        data[offset + 1] = 0xFF;
-                        data[offset + 2] = 0xFF;
-                        data[offset + 3] = 0xFF;
-                    }
-                    offset += bpp;
-                }
-            }
-            // Bottom row
-            if (max_y > d) {
-                const bot_y = max_y - 1 - @as(u32, @intCast(d));
-                var offset = bot_y * stride + sel.x * bpp;
-                for (sel.x..max_x) |_| {
-                    if (offset + 3 < data.len) {
-                        data[offset] = 0xFF;
-                        data[offset + 1] = 0xFF;
-                        data[offset + 2] = 0xFF;
-                        data[offset + 3] = 0xFF;
-                    }
-                    offset += bpp;
-                }
+        for (ry..y_end) |y| {
+            for (rx..x_end) |x| {
+                setPixel(data, stride, @intCast(x), @intCast(y), r, g, b);
             }
         }
+    }
 
-        // Vertical borders (left + right) -- only the inner rows (skip corners already drawn)
-        const inner_start = sel.y + border;
-        const inner_end = max_y -| border; // saturating subtract
+    fn drawSelectionBorder(self: *Overlay, data: []u8, stride: u32, sel: Rect) void {
+        const border: u32 = 1;
+        const sw = self.surface_width;
+        const sh = self.surface_height;
 
-        if (inner_start >= inner_end) return;
+        const max_x = @min(sel.x + sel.width, sw);
+        const max_y = @min(sel.y + sel.height, sh);
 
-        for (inner_start..inner_end) |y| {
-            for (0..border) |d| {
-                // Left
-                const lx = sel.x + @as(u32, @intCast(d));
-                if (lx < self.surface_width) {
-                    const offset = @as(u32, @intCast(y)) * stride + lx * bpp;
-                    if (offset + 3 < data.len) {
-                        data[offset] = 0xFF;
-                        data[offset + 1] = 0xFF;
-                        data[offset + 2] = 0xFF;
-                        data[offset + 3] = 0xFF;
-                    }
-                }
-                // Right
-                if (max_x > d) {
-                    const rx = max_x - 1 - @as(u32, @intCast(d));
-                    const offset = @as(u32, @intCast(y)) * stride + rx * bpp;
-                    if (offset + 3 < data.len) {
-                        data[offset] = 0xFF;
-                        data[offset + 1] = 0xFF;
-                        data[offset + 2] = 0xFF;
-                        data[offset + 3] = 0xFF;
-                    }
-                }
-            }
+        // Top edge
+        fillRect(data, stride, sel.x, sel.y, sel.width, border, sw, sh, 0xFF, 0xFF, 0xFF);
+        // Bottom edge
+        if (max_y > 0) {
+            fillRect(data, stride, sel.x, max_y -| border, sel.width, border, sw, sh, 0xFF, 0xFF, 0xFF);
         }
+        // Left edge
+        fillRect(data, stride, sel.x, sel.y, border, sel.height, sw, sh, 0xFF, 0xFF, 0xFF);
+        // Right edge
+        if (max_x > 0) {
+            fillRect(data, stride, max_x -| border, sel.y, border, sel.height, sw, sh, 0xFF, 0xFF, 0xFF);
+        }
+    }
+
+    fn drawHandles(self: *Overlay, data: []u8, stride: u32, sel: Rect) void {
+        const sw = self.surface_width;
+        const sh = self.surface_height;
+
+        // Handle dimensions
+        const handle_len: u32 = 16; // length of the L-shaped corner arm
+        const handle_thick: u32 = 3; // thickness
+        const edge_handle_len: u32 = 12; // length of midpoint edge handles
+        const edge_handle_thick: u32 = 3;
+
+        const max_x = @min(sel.x + sel.width, sw);
+        const max_y = @min(sel.y + sel.height, sh);
+
+        if (sel.width < 4 or sel.height < 4) return;
+
+        // ── Corner handles (L-shaped) ───────────────────────────────
+        const hl = @min(handle_len, sel.width / 2);
+        const vl = @min(handle_len, sel.height / 2);
+
+        // Top-left corner
+        fillRect(data, stride, sel.x, sel.y, hl, handle_thick, sw, sh, 0xFF, 0xFF, 0xFF);
+        fillRect(data, stride, sel.x, sel.y, handle_thick, vl, sw, sh, 0xFF, 0xFF, 0xFF);
+
+        // Top-right corner
+        fillRect(data, stride, max_x -| hl, sel.y, hl, handle_thick, sw, sh, 0xFF, 0xFF, 0xFF);
+        fillRect(data, stride, max_x -| handle_thick, sel.y, handle_thick, vl, sw, sh, 0xFF, 0xFF, 0xFF);
+
+        // Bottom-left corner
+        fillRect(data, stride, sel.x, max_y -| handle_thick, hl, handle_thick, sw, sh, 0xFF, 0xFF, 0xFF);
+        fillRect(data, stride, sel.x, max_y -| vl, handle_thick, vl, sw, sh, 0xFF, 0xFF, 0xFF);
+
+        // Bottom-right corner
+        fillRect(data, stride, max_x -| hl, max_y -| handle_thick, hl, handle_thick, sw, sh, 0xFF, 0xFF, 0xFF);
+        fillRect(data, stride, max_x -| handle_thick, max_y -| vl, handle_thick, vl, sw, sh, 0xFF, 0xFF, 0xFF);
+
+        // ── Edge midpoint handles (short bars) ──────────────────────
+        const mid_x = sel.x + sel.width / 2;
+        const mid_y = sel.y + sel.height / 2;
+        const ehl = @min(edge_handle_len, sel.width / 2);
+        const evl = @min(edge_handle_len, sel.height / 2);
+
+        // Top edge center
+        fillRect(data, stride, mid_x -| (ehl / 2), sel.y, ehl, edge_handle_thick, sw, sh, 0xFF, 0xFF, 0xFF);
+
+        // Bottom edge center
+        fillRect(data, stride, mid_x -| (ehl / 2), max_y -| edge_handle_thick, ehl, edge_handle_thick, sw, sh, 0xFF, 0xFF, 0xFF);
+
+        // Left edge center
+        fillRect(data, stride, sel.x, mid_y -| (evl / 2), edge_handle_thick, evl, sw, sh, 0xFF, 0xFF, 0xFF);
+
+        // Right edge center
+        fillRect(data, stride, max_x -| edge_handle_thick, mid_y -| (evl / 2), edge_handle_thick, evl, sw, sh, 0xFF, 0xFF, 0xFF);
     }
 
     pub fn run(self: *Overlay) !?Rect {
