@@ -346,8 +346,6 @@ pub fn main() !void {
             wl_shm.?,
         );
     }
-    defer capture.deinit();
-
     var screenshot = capture.getImage();
 
     // Step 2: Region selection or fullscreen
@@ -505,23 +503,14 @@ pub fn main() !void {
         },
     }
 
-    if (clipboard_forked) {
-        // A child process is serving clipboard on our Wayland connection.
-        // We must NOT disconnect/destroy anything — just exit quietly.
-        // The child will exit when the clipboard is replaced.
-        return;
-    }
+    // Clean up capture resources (holds references to protocol objects)
+    capture.deinit();
 
-    // Cleanup globals (only when no clipboard daemon is running)
-    if (data_control_manager) |m| wl.c.ext_data_control_manager_v1_destroy(m);
-    if (layer_shell) |ls| wl.c.zwlr_layer_shell_v1_destroy(ls);
-    if (capture_manager) |cm| wl.c.ext_image_copy_capture_manager_v1_destroy(cm);
-    if (source_manager) |sm| wl.c.ext_output_image_capture_source_manager_v1_destroy(sm);
-    if (screencopy_manager) |sm| wl.c.zwlr_screencopy_manager_v1_destroy(sm);
-    if (wl_seat) |s| wl.c.wl_seat_destroy(s);
-    wl.c.wl_shm_destroy(wl_shm.?);
-    wl.c.wl_compositor_destroy(wl_compositor.?);
-    wl.c.wl_display_disconnect(wl_display);
+    // When a clipboard daemon was forked, it shares our Wayland connection fd.
+    // We cannot disconnect or destroy globals — just let the process exit.
+    // When no fork happened, the OS cleans up on exit anyway, so explicit
+    // cleanup is unnecessary and was actually causing a use-after-free
+    // (capture.deinit running after global destroy).
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
