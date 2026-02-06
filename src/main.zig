@@ -7,6 +7,21 @@ const Rect = @import("image.zig").Rect;
 const CaptureState = @import("capture.zig").CaptureState;
 const Overlay = @import("overlay.zig").Overlay;
 
+// ── Timer ────────────────────────────────────────────────────────────────────
+
+const Timer = struct {
+    start_ns: i128,
+
+    fn start() Timer {
+        return .{ .start_ns = std.time.nanoTimestamp() };
+    }
+
+    fn elapsedMs(self: Timer) f64 {
+        const end_ns = std.time.nanoTimestamp();
+        return @as(f64, @floatFromInt(end_ns - self.start_ns)) / 1_000_000.0;
+    }
+};
+
 // ── Wayland globals ─────────────────────────────────────────────────────────
 
 var wl_display: ?*wl.c.wl_display = null;
@@ -327,14 +342,16 @@ pub fn main() !void {
 
     switch (action) {
         .copy_to_clipboard => {
+            const timer = Timer.start();
             // Save to a temp file, then pipe to wl-copy
             const tmp_path = "/tmp/screenshot-clipboard.png";
             try save_target.savePng(tmp_path);
             try copyToClipboard(allocator, tmp_path);
             std.fs.deleteFileAbsolute(tmp_path) catch {};
-            std.log.info("copied to clipboard", .{});
+            std.log.info("copied to clipboard in {d:.1}ms", .{timer.elapsedMs()});
         },
         .save_to_file => {
+            const timer = Timer.start();
             const owned_path = if (output_path_arg) |p|
                 try allocator.dupeZ(u8, p)
             else
@@ -342,7 +359,7 @@ pub fn main() !void {
             defer allocator.free(owned_path);
 
             try save_target.savePng(owned_path.ptr);
-            std.log.info("saved to {s}", .{owned_path});
+            std.log.info("saved to {s} in {d:.1}ms", .{ owned_path, timer.elapsedMs() });
         },
         .cancel => unreachable, // handled above
         .none => {
