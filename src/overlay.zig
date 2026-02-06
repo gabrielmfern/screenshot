@@ -210,9 +210,17 @@ pub const Overlay = struct {
         // Fast bulk copy of the pre-rendered dark background
         @memcpy(data[0..bg.len], bg);
 
-        if (!self.selecting) return;
+        // Determine which rect to render:
+        // 1. If actively dragging, compute live from mouse coordinates
+        // 2. If a selection is locked in (mouse released), use that
+        // 3. Otherwise, nothing to highlight
+        const sel = if (self.selecting)
+            Rect.fromPoints(self.start_x, self.start_y, self.current_x, self.current_y)
+        else if (self.selection) |s|
+            s
+        else
+            return;
 
-        const sel = Rect.fromPoints(self.start_x, self.start_y, self.current_x, self.current_y);
         if (sel.isEmpty()) return;
 
         // Clamp selection to surface bounds
