@@ -319,10 +319,14 @@ pub fn main() !void {
             .screenshot = &screenshot,
         };
         try overlay.init(allocator);
-        defer overlay.deinit();
 
         const result = try overlay.run();
         action = result.action;
+
+        // Dismiss the overlay immediately so the user sees it disappear
+        // before the save/copy work begins.
+        overlay.deinit();
+        _ = wl.c.wl_display_flush(wl_display);
 
         if (action == .cancel) {
             std.log.info("cancelled", .{});
