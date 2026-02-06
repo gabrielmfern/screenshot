@@ -1,0 +1,22 @@
+.{
+    .name = .screenshot,
+    .version = "0.0.0",
+    .fingerprint = 0x58991e41152b737d,
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .wayland = .{
+            .url = "git+https://codeberg.org/ifreund/zig-wayland.git#e57368ecbda85d564362779b253b744260a4b053",
+            .hash = "wayland-0.5.0-dev-lQa1kv_ZAQCZfnVZMocokZ78QJbH6NaM5RUC9ODQPhx5",
+        },
+        .stb_image = .{
+            .path = "dependencies/stb_image",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "docs",
+        "dependencies",
+    },
+}
