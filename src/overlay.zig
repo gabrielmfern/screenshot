@@ -6,9 +6,6 @@ const Image = @import("image.zig").Image;
 const Rect = @import("image.zig").Rect;
 
 /// State for the fullscreen selection overlay.
-/// Uses wlr-layer-shell to create an overlay surface, renders the captured
-/// screenshot as background (with a dark tint outside the selection), and
-/// lets the user click-drag to select a rectangular region.
 pub const Overlay = struct {
     // Wayland globals (borrowed references)
     display: *wl.c.wl_display = undefined,
@@ -38,9 +35,13 @@ pub const Overlay = struct {
     surface_height: u32 = 0,
     configured: bool = false,
 
-    // SHM buffers (double-buffered: write to one while the other is committed)
+    // SHM buffers (double-buffered)
     buffers: [2]?ShmBuffer = .{ null, null },
     current_buf: u1 = 0,
+
+    // Pre-rendered darkened background (computed once, memcpy'd each frame)
+    dark_bg: ?[]u8 = null,
+    allocator: std.mem.Allocator = undefined,
 
     // Rendering state
     needs_redraw: bool = false,
@@ -53,7 +54,7 @@ pub const Overlay = struct {
     current_x: i32 = 0,
     current_y: i32 = 0,
 
-    // Pointer enter serial (needed for set_cursor)
+    // Pointer enter serial
     pointer_serial: u32 = 0,
 
     // Result
@@ -61,9 +62,9 @@ pub const Overlay = struct {
     cancelled: bool = false,
     done: bool = false,
 
-    /// Initialize and show the overlay.
-    pub fn init(self: *Overlay) !void {
-        // Load cursor theme for crosshair cursor
+    pub fn init(self: *Overlay, allocator: std.mem.Allocator) !void {
+        self.allocator = allocator;
+
         self.cursor_theme = wl.c.wl_cursor_theme_load(null, 24, self.shm);
         self.cursor_surface = wl.c.wl_compositor_create_surface(self.compositor);
 
@@ -78,7 +79,6 @@ pub const Overlay = struct {
             "screenshot-selection",
         ) orelse return error.FailedToCreateLayerSurface;
 
-        // Anchor to all edges so the surface fills the entire output
         wl.c.zwlr_layer_surface_v1_set_anchor(
             self.layer_surface.?,
             wl.c.ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
@@ -98,10 +98,8 @@ pub const Overlay = struct {
             self,
         );
 
-        // Initial commit to trigger configure
         wl.c.wl_surface_commit(self.surface.?);
 
-        // Get pointer and keyboard for input
         self.pointer = wl.c.wl_seat_get_pointer(self.seat);
         if (self.pointer) |ptr| {
             _ = wl.c.wl_pointer_add_listener(ptr, &pointer_listener, self);
@@ -111,16 +109,15 @@ pub const Overlay = struct {
             _ = wl.c.wl_keyboard_add_listener(kbd, &keyboard_listener, self);
         }
 
-        // Wait for configure
         while (!self.configured) {
             if (wl.c.wl_display_roundtrip(self.display) == -1)
                 return error.WaylandRoundtripFailed;
         }
 
-        // Create double buffers
         try self.createBuffers();
+        try self.preRenderDarkBackground();
 
-        // Render and commit the initial frame (darkened screenshot, no selection)
+        // Initial frame: just the darkened background
         self.renderToBuffer();
         self.commitBuffer();
     }
@@ -137,7 +134,30 @@ pub const Overlay = struct {
         }
     }
 
-    /// Set the cursor image to a crosshair.
+    /// Pre-render the darkened screenshot into a CPU-side buffer.
+    /// This is done once and then memcpy'd into the back buffer each frame.
+    fn preRenderDarkBackground(self: *Overlay) !void {
+        const stride = self.surface_width * ShmBuffer.bpp;
+        const size: usize = @as(usize, self.surface_height) * stride;
+        self.dark_bg = try self.allocator.alloc(u8, size);
+        const bg = self.dark_bg.?;
+        const bpp = ShmBuffer.bpp;
+
+        for (0..self.surface_height) |y| {
+            for (0..self.surface_width) |x| {
+                const dst_offset = y * stride + x * bpp;
+                const src_offset = y * self.screenshot.stride + x * Image.bpp;
+
+                if (src_offset + 3 < self.screenshot.data.len and dst_offset + 3 < bg.len) {
+                    bg[dst_offset + 0] = self.screenshot.data[src_offset + 0] / 3;
+                    bg[dst_offset + 1] = self.screenshot.data[src_offset + 1] / 3;
+                    bg[dst_offset + 2] = self.screenshot.data[src_offset + 2] / 3;
+                    bg[dst_offset + 3] = 0xFF;
+                }
+            }
+        }
+    }
+
     fn setCursor(self: *Overlay, serial: u32) void {
         const theme = self.cursor_theme orelse return;
         const cursor_sfc = self.cursor_surface orelse return;
@@ -167,52 +187,56 @@ pub const Overlay = struct {
         );
     }
 
-    /// Render the overlay into the current back buffer.
+    /// Render into the current back buffer.
+    /// Strategy: memcpy the pre-rendered dark background, then restore only
+    /// the pixels inside the selection to full brightness. O(selection_area)
+    /// instead of O(screen_area).
     fn renderToBuffer(self: *Overlay) void {
         const buf = &(self.buffers[self.current_buf] orelse return);
         const data = buf.data;
         const stride = buf.stride;
+        const bg = self.dark_bg orelse return;
+
+        // Fast bulk copy of the pre-rendered dark background
+        @memcpy(data[0..bg.len], bg);
+
+        if (!self.selecting) return;
+
+        const sel = Rect.fromPoints(self.start_x, self.start_y, self.current_x, self.current_y);
+        if (sel.isEmpty()) return;
+
+        // Clamp selection to surface bounds
+        const clamped = sel.clampToBounds(self.surface_width, self.surface_height);
+        if (clamped.isEmpty()) return;
+
         const bpp = ShmBuffer.bpp;
 
-        const sel = if (self.selecting)
-            Rect.fromPoints(self.start_x, self.start_y, self.current_x, self.current_y)
-        else
-            Rect{ .x = 0, .y = 0, .width = 0, .height = 0 };
+        // Restore original brightness only inside the selection rectangle
+        for (clamped.y..clamped.y + clamped.height) |y| {
+            const dst_row_start = y * stride + clamped.x * bpp;
+            const src_row_start = y * self.screenshot.stride + clamped.x * Image.bpp;
+            const row_bytes = clamped.width * bpp;
 
-        for (0..self.surface_height) |y| {
-            for (0..self.surface_width) |x| {
-                const dst_offset = y * stride + x * bpp;
-                const src_offset = y * self.screenshot.stride + x * Image.bpp;
-
-                const ux: u32 = @intCast(x);
-                const uy: u32 = @intCast(y);
-                const inside_selection = !sel.isEmpty() and
-                    ux >= sel.x and ux < sel.x + sel.width and
-                    uy >= sel.y and uy < sel.y + sel.height;
-
-                if (src_offset + 3 < self.screenshot.data.len and dst_offset + 3 < data.len) {
-                    if (inside_selection) {
-                        data[dst_offset + 0] = self.screenshot.data[src_offset + 0];
-                        data[dst_offset + 1] = self.screenshot.data[src_offset + 1];
-                        data[dst_offset + 2] = self.screenshot.data[src_offset + 2];
-                        data[dst_offset + 3] = 0xFF;
-                    } else {
-                        data[dst_offset + 0] = self.screenshot.data[src_offset + 0] / 3;
-                        data[dst_offset + 1] = self.screenshot.data[src_offset + 1] / 3;
-                        data[dst_offset + 2] = self.screenshot.data[src_offset + 2] / 3;
-                        data[dst_offset + 3] = 0xFF;
-                    }
+            if (src_row_start + row_bytes <= self.screenshot.data.len and
+                dst_row_start + row_bytes <= data.len)
+            {
+                @memcpy(
+                    data[dst_row_start..][0..row_bytes],
+                    self.screenshot.data[src_row_start..][0..row_bytes],
+                );
+                // Fix alpha channel (screenshot might be XRGB with alpha=0)
+                var x: usize = dst_row_start;
+                const end = dst_row_start + row_bytes;
+                while (x + 3 < end) : (x += bpp) {
+                    data[x + 3] = 0xFF;
                 }
             }
         }
 
-        // Draw selection border (white, 2px)
-        if (!sel.isEmpty()) {
-            self.drawSelectionBorder(data, stride, sel);
-        }
+        // Draw white selection border
+        self.drawSelectionBorder(data, stride, clamped);
     }
 
-    /// Commit the current back buffer to the surface and swap.
     fn commitBuffer(self: *Overlay) void {
         const buf = &(self.buffers[self.current_buf] orelse return);
         wl.c.wl_surface_attach(self.surface.?, buf.wl_buffer, 0, 0);
@@ -224,71 +248,83 @@ pub const Overlay = struct {
             @intCast(self.surface_height),
         );
         wl.c.wl_surface_commit(self.surface.?);
-        // Swap to the other buffer for next frame
         self.current_buf +%= 1;
     }
 
-    /// Request a redraw on the next frame callback.
     fn scheduleRedraw(self: *Overlay) void {
         self.needs_redraw = true;
         if (!self.frame_pending) {
             self.frame_pending = true;
             const cb = wl.c.wl_surface_frame(self.surface.?) orelse return;
             _ = wl.c.wl_callback_add_listener(cb, &frame_listener, self);
-            // We still need to commit to get the frame callback
             wl.c.wl_surface_commit(self.surface.?);
         }
     }
 
     fn drawSelectionBorder(self: *Overlay, data: []u8, stride: u32, sel: Rect) void {
-        const border_width: u32 = 2;
+        const border: u32 = 2;
         const bpp = ShmBuffer.bpp;
 
         const max_x = @min(sel.x + sel.width, self.surface_width);
         const max_y = @min(sel.y + sel.height, self.surface_height);
 
-        // Top and bottom borders
-        for (sel.x..max_x) |x| {
-            for (0..border_width) |d| {
-                if (sel.y + d < self.surface_height) {
-                    const offset = (sel.y + @as(u32, @intCast(d))) * stride + @as(u32, @intCast(x)) * bpp;
+        // Horizontal borders (top + bottom) -- write full rows for speed
+        for (0..border) |d| {
+            // Top row
+            const top_y = sel.y + @as(u32, @intCast(d));
+            if (top_y < self.surface_height) {
+                var offset = top_y * stride + sel.x * bpp;
+                for (sel.x..max_x) |_| {
                     if (offset + 3 < data.len) {
-                        data[offset + 0] = 0xFF;
+                        data[offset] = 0xFF;
                         data[offset + 1] = 0xFF;
                         data[offset + 2] = 0xFF;
                         data[offset + 3] = 0xFF;
                     }
+                    offset += bpp;
                 }
-                if (max_y > d) {
-                    const by = max_y - 1 - @as(u32, @intCast(d));
-                    const offset = by * stride + @as(u32, @intCast(x)) * bpp;
+            }
+            // Bottom row
+            if (max_y > d) {
+                const bot_y = max_y - 1 - @as(u32, @intCast(d));
+                var offset = bot_y * stride + sel.x * bpp;
+                for (sel.x..max_x) |_| {
                     if (offset + 3 < data.len) {
-                        data[offset + 0] = 0xFF;
+                        data[offset] = 0xFF;
                         data[offset + 1] = 0xFF;
                         data[offset + 2] = 0xFF;
                         data[offset + 3] = 0xFF;
                     }
+                    offset += bpp;
                 }
             }
         }
 
-        // Left and right borders
-        for (sel.y..max_y) |y| {
-            for (0..border_width) |d| {
-                if (sel.x + d < self.surface_width) {
-                    const offset = @as(u32, @intCast(y)) * stride + (sel.x + @as(u32, @intCast(d))) * bpp;
+        // Vertical borders (left + right) -- only the inner rows (skip corners already drawn)
+        const inner_start = sel.y + border;
+        const inner_end = max_y -| border; // saturating subtract
+
+        if (inner_start >= inner_end) return;
+
+        for (inner_start..inner_end) |y| {
+            for (0..border) |d| {
+                // Left
+                const lx = sel.x + @as(u32, @intCast(d));
+                if (lx < self.surface_width) {
+                    const offset = @as(u32, @intCast(y)) * stride + lx * bpp;
                     if (offset + 3 < data.len) {
-                        data[offset + 0] = 0xFF;
+                        data[offset] = 0xFF;
                         data[offset + 1] = 0xFF;
                         data[offset + 2] = 0xFF;
                         data[offset + 3] = 0xFF;
                     }
                 }
+                // Right
                 if (max_x > d) {
                     const rx = max_x - 1 - @as(u32, @intCast(d));
                     const offset = @as(u32, @intCast(y)) * stride + rx * bpp;
                     if (offset + 3 < data.len) {
-                        data[offset + 0] = 0xFF;
+                        data[offset] = 0xFF;
                         data[offset + 1] = 0xFF;
                         data[offset + 2] = 0xFF;
                         data[offset + 3] = 0xFF;
@@ -298,7 +334,6 @@ pub const Overlay = struct {
         }
     }
 
-    /// Run the event loop until the user finishes selection or cancels.
     pub fn run(self: *Overlay) !?Rect {
         while (!self.done and !self.cancelled) {
             if (wl.c.wl_display_dispatch(self.display) == -1)
@@ -309,7 +344,6 @@ pub const Overlay = struct {
         return self.selection;
     }
 
-    /// Clean up all overlay resources.
     pub fn deinit(self: *Overlay) void {
         if (self.keyboard) |kbd| wl.c.wl_keyboard_destroy(kbd);
         if (self.pointer) |ptr| wl.c.wl_pointer_destroy(ptr);
@@ -318,6 +352,7 @@ pub const Overlay = struct {
         for (&self.buffers) |*buf| {
             if (buf.*) |*b| b.destroy();
         }
+        if (self.dark_bg) |bg| self.allocator.free(bg);
         if (self.layer_surface) |ls| wl.c.zwlr_layer_surface_v1_destroy(ls);
         if (self.surface) |s| wl.c.wl_surface_destroy(s);
     }
@@ -335,7 +370,6 @@ fn frameCallback(data: ?*anyopaque, cb: ?*wl.c.wl_callback, _: u32) callconv(.c)
         self.renderToBuffer();
         self.commitBuffer();
 
-        // If still selecting, keep scheduling redraws
         if (self.selecting) {
             self.scheduleRedraw();
         }
@@ -348,13 +382,7 @@ const frame_listener: wl.c.wl_callback_listener = .{
 
 // ── Layer surface listener ──────────────────────────────────────────────────
 
-fn layerSurfaceConfigure(
-    data: ?*anyopaque,
-    surface: ?*wl.c.zwlr_layer_surface_v1,
-    serial: u32,
-    w: u32,
-    h: u32,
-) callconv(.c) void {
+fn layerSurfaceConfigure(data: ?*anyopaque, surface: ?*wl.c.zwlr_layer_surface_v1, serial: u32, w: u32, h: u32) callconv(.c) void {
     const self: *Overlay = @ptrCast(@alignCast(data));
     self.surface_width = w;
     self.surface_height = h;
@@ -395,10 +423,9 @@ fn pointerMotion(data: ?*anyopaque, _: ?*wl.c.wl_pointer, _: u32, sx: wl.c.wl_fi
     }
 }
 
-fn pointerButton(data: ?*anyopaque, _: ?*wl.c.wl_pointer, serial: u32, _: u32, button: u32, state: u32) callconv(.c) void {
+fn pointerButton(data: ?*anyopaque, _: ?*wl.c.wl_pointer, _: u32, _: u32, button: u32, state: u32) callconv(.c) void {
     const self: *Overlay = @ptrCast(@alignCast(data));
-    _ = serial;
-    const BTN_LEFT = 0x110; // linux/input-event-codes.h
+    const BTN_LEFT = 0x110;
 
     if (button == BTN_LEFT) {
         if (state == wl.c.WL_POINTER_BUTTON_STATE_PRESSED) {
@@ -419,7 +446,6 @@ fn pointerButton(data: ?*anyopaque, _: ?*wl.c.wl_pointer, serial: u32, _: u32, b
                     self.selection = sel;
                     self.done = true;
                 } else {
-                    // Selection was too small / a single click -- redraw to clear
                     self.renderToBuffer();
                     self.commitBuffer();
                 }
@@ -449,23 +475,19 @@ fn kbKeymap(_: ?*anyopaque, _: ?*wl.c.wl_keyboard, _: u32, fd: i32, _: u32) call
 }
 
 fn kbEnter(_: ?*anyopaque, _: ?*wl.c.wl_keyboard, _: u32, _: ?*wl.c.wl_surface, _: [*c]wl.c.wl_array) callconv(.c) void {}
-
 fn kbLeave(_: ?*anyopaque, _: ?*wl.c.wl_keyboard, _: u32, _: ?*wl.c.wl_surface) callconv(.c) void {}
 
 fn kbKey(data: ?*anyopaque, _: ?*wl.c.wl_keyboard, _: u32, _: u32, key: u32, state: u32) callconv(.c) void {
     const self: *Overlay = @ptrCast(@alignCast(data));
     if (state != wl.c.WL_KEYBOARD_KEY_STATE_PRESSED) return;
 
-    const KEY_ESC = 1; // linux/input-event-codes.h
-
-    if (key == KEY_ESC) {
+    if (key == 1) { // KEY_ESC
         self.cancelled = true;
         self.done = true;
     }
 }
 
 fn kbModifiers(_: ?*anyopaque, _: ?*wl.c.wl_keyboard, _: u32, _: u32, _: u32, _: u32, _: u32) callconv(.c) void {}
-
 fn kbRepeatInfo(_: ?*anyopaque, _: ?*wl.c.wl_keyboard, _: i32, _: i32) callconv(.c) void {}
 
 const keyboard_listener: wl.c.wl_keyboard_listener = .{

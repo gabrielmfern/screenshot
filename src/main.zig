@@ -221,7 +221,7 @@ pub fn main() !void {
             .output = wl_output.?,
             .screenshot = &screenshot,
         };
-        try overlay.init();
+        try overlay.init(allocator);
         defer overlay.deinit();
 
         const selection = try overlay.run();
