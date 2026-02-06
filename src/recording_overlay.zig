@@ -21,7 +21,6 @@ pub const RecordingOverlay = struct {
 
     // Input
     pointer: ?*wl.c.wl_pointer = null,
-    keyboard: ?*wl.c.wl_keyboard = null,
     cursor_theme: ?*wl.c.wl_cursor_theme = null,
     cursor_surface: ?*wl.c.wl_surface = null,
 
@@ -44,9 +43,6 @@ pub const RecordingOverlay = struct {
     current_x: i32 = 0,
     current_y: i32 = 0,
     hovered_button: ?ControlButton = null,
-
-    // Keyboard state
-    ctrl_held: bool = false,
 
     // Recording region
     region: Rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
@@ -165,9 +161,10 @@ pub const RecordingOverlay = struct {
                 wl.c.ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT,
         );
         wl.c.zwlr_layer_surface_v1_set_exclusive_zone(self.layer_surface.?, -1);
+        // No keyboard grab — let the user type in other apps while recording
         wl.c.zwlr_layer_surface_v1_set_keyboard_interactivity(
             self.layer_surface.?,
-            wl.c.ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE,
+            wl.c.ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE,
         );
 
         _ = wl.c.zwlr_layer_surface_v1_add_listener(
@@ -182,10 +179,7 @@ pub const RecordingOverlay = struct {
         if (self.pointer) |ptr| {
             _ = wl.c.wl_pointer_add_listener(ptr, &rec_pointer_listener, self);
         }
-        self.keyboard = wl.c.wl_seat_get_keyboard(self.seat);
-        if (self.keyboard) |kbd| {
-            _ = wl.c.wl_keyboard_add_listener(kbd, &rec_keyboard_listener, self);
-        }
+        // No keyboard listener — we don't grab keyboard during recording
 
         while (!self.configured) {
             if (wl.c.wl_display_roundtrip(self.display) == -1)
@@ -193,10 +187,21 @@ pub const RecordingOverlay = struct {
         }
 
         try self.createBuffers();
+        self.updateInputRegion();
         self.renderToBuffer();
         self.commitBuffer();
         // Start the continuous redraw loop for the timer
         self.scheduleRedraw();
+    }
+
+    /// Set the input region to only cover the control bar, so pointer events
+    /// pass through everywhere else (the user can interact with other apps).
+    fn updateInputRegion(self: *RecordingOverlay) void {
+        const bar = self.controlBarRect();
+        const region = wl.c.wl_compositor_create_region(self.compositor) orelse return;
+        wl.c.wl_region_add(region, @intCast(bar.x), @intCast(bar.y), @intCast(bar.width), @intCast(bar.height));
+        wl.c.wl_surface_set_input_region(self.surface.?, region);
+        wl.c.wl_region_destroy(region);
     }
 
     fn createBuffers(self: *RecordingOverlay) !void {
@@ -570,7 +575,6 @@ pub const RecordingOverlay = struct {
     }
 
     pub fn deinit(self: *RecordingOverlay) void {
-        if (self.keyboard) |kbd| wl.c.wl_keyboard_destroy(kbd);
         if (self.pointer) |ptr| wl.c.wl_pointer_destroy(ptr);
         if (self.cursor_surface) |s| wl.c.wl_surface_destroy(s);
         if (self.cursor_theme) |t| wl.c.wl_cursor_theme_destroy(t);
@@ -692,36 +696,4 @@ const rec_pointer_listener: wl.c.wl_pointer_listener = .{
     .axis = recPointerAxis,
     .frame = recPointerFrame,
     .axis_source = recPointerAxisSource,
-};
-
-// ── Keyboard listener ───────────────────────────────────────────────────────
-
-fn recKbKeymap(_: ?*anyopaque, _: ?*wl.c.wl_keyboard, _: u32, fd: i32, _: u32) callconv(.c) void {
-    std.posix.close(fd);
-}
-
-fn recKbEnter(_: ?*anyopaque, _: ?*wl.c.wl_keyboard, _: u32, _: ?*wl.c.wl_surface, _: [*c]wl.c.wl_array) callconv(.c) void {}
-fn recKbLeave(_: ?*anyopaque, _: ?*wl.c.wl_keyboard, _: u32, _: ?*wl.c.wl_surface) callconv(.c) void {}
-
-fn recKbKey(data: ?*anyopaque, _: ?*wl.c.wl_keyboard, _: u32, _: u32, key: u32, state: u32) callconv(.c) void {
-    const self: *RecordingOverlay = @ptrCast(@alignCast(data));
-    if (state != wl.c.WL_KEYBOARD_KEY_STATE_PRESSED) return;
-
-    const KEY_ESC = 1;
-    if (key == KEY_ESC) {
-        self.action = .stop;
-        self.done = true;
-    }
-}
-
-fn recKbModifiers(_: ?*anyopaque, _: ?*wl.c.wl_keyboard, _: u32, _: u32, _: u32, _: u32, _: u32) callconv(.c) void {}
-fn recKbRepeatInfo(_: ?*anyopaque, _: ?*wl.c.wl_keyboard, _: i32, _: i32) callconv(.c) void {}
-
-const rec_keyboard_listener: wl.c.wl_keyboard_listener = .{
-    .keymap = recKbKeymap,
-    .enter = recKbEnter,
-    .leave = recKbLeave,
-    .key = recKbKey,
-    .modifiers = recKbModifiers,
-    .repeat_info = recKbRepeatInfo,
 };
