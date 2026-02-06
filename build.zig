@@ -20,6 +20,9 @@ pub fn build(b: *std.Build) void {
     module.linkSystemLibrary("libavutil", .{});
     module.linkSystemLibrary("libswscale", .{});
 
+    // PulseAudio simple API for sound effects (routes through PipeWire)
+    module.linkSystemLibrary("libpulse-simple", .{});
+
     const Protocol = struct {
         name: []const u8,
         xmlPath: []const u8,

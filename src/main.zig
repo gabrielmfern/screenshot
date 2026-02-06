@@ -9,6 +9,7 @@ const Overlay = @import("overlay.zig").Overlay;
 const Recorder = @import("recorder.zig").Recorder;
 const RecordingOverlay = @import("recording_overlay.zig").RecordingOverlay;
 const Clipboard = @import("clipboard.zig").Clipboard;
+const Audio = @import("audio.zig").Audio;
 
 // ── Timer ────────────────────────────────────────────────────────────────────
 
@@ -407,6 +408,7 @@ pub fn main() !void {
             try copyFileToClipboard(allocator, tmp_path, "image/png");
             clipboard_forked = true;
             std.fs.deleteFileAbsolute(tmp_path) catch {};
+            Audio.play(.shutter);
             std.log.info("copied to clipboard in {d:.1}ms", .{timer.elapsedMs()});
         },
         .save_to_file, .take_screenshot => {
@@ -418,6 +420,7 @@ pub fn main() !void {
             defer allocator.free(owned_path);
 
             try save_target.savePng(owned_path.ptr);
+            Audio.play(.shutter);
             std.log.info("saved to {s} in {d:.1}ms", .{ owned_path, timer.elapsedMs() });
         },
         .record => {
@@ -444,6 +447,8 @@ pub fn main() !void {
                 return;
             };
             defer recorder.deinit();
+
+            Audio.play(.record_start);
 
             // Show recording overlay
             var rec_overlay = RecordingOverlay{
@@ -497,6 +502,7 @@ pub fn main() !void {
             // Stop recorder (closes ffmpeg stdin, waits for muxing to finish)
             var stop_timer = Timer.start();
             recorder.stop();
+            Audio.play(.record_stop);
             std.log.info("recorder stopped in {d:.1}ms", .{stop_timer.elapsedMs()});
 
             // Move the recording to a permanent location
@@ -588,4 +594,5 @@ comptime {
     _ = @import("recorder.zig");
     _ = @import("recording_overlay.zig");
     _ = @import("clipboard.zig");
+    _ = @import("audio.zig");
 }
