@@ -49,10 +49,13 @@ pub const Overlay = struct {
 
     // Selection state
     selecting: bool = false,
+    moving: bool = false,
     start_x: i32 = 0,
     start_y: i32 = 0,
     current_x: i32 = 0,
     current_y: i32 = 0,
+    move_offset_x: i32 = 0, // pointer offset from selection origin when drag started
+    move_offset_y: i32 = 0,
 
     // Pointer enter serial
     pointer_serial: u32 = 0,
@@ -115,6 +118,15 @@ pub const Overlay = struct {
             .width = button_size,
             .height = button_size,
         };
+    }
+
+    fn hitTestSelection(self: *const Overlay, px: i32, py: i32) bool {
+        const sel = self.selection orelse return false;
+        if (px < 0 or py < 0) return false;
+        const ux: u32 = @intCast(px);
+        const uy: u32 = @intCast(py);
+        return ux >= sel.x and ux < sel.x + sel.width and
+            uy >= sel.y and uy < sel.y + sel.height;
     }
 
     fn hitTestToolbar(self: *const Overlay, px: i32, py: i32) ?ToolbarButton {
@@ -676,7 +688,7 @@ fn frameCallback(data: ?*anyopaque, cb: ?*wl.c.wl_callback, _: u32) callconv(.c)
         self.renderToBuffer();
         self.commitBuffer();
 
-        if (self.selecting) {
+        if (self.selecting or self.moving) {
             self.scheduleRedraw();
         }
     }
@@ -726,16 +738,44 @@ fn pointerMotion(data: ?*anyopaque, _: ?*wl.c.wl_pointer, _: u32, sx: wl.c.wl_fi
 
     if (self.selecting) {
         self.scheduleRedraw();
+    } else if (self.moving) {
+        // Move the selection to follow the pointer
+        if (self.selection) |sel| {
+            const new_x = self.current_x - self.move_offset_x;
+            const new_y = self.current_y - self.move_offset_y;
+            // Clamp to surface bounds
+            const clamped_x: u32 = @intCast(@max(0, @min(new_x, @as(i32, @intCast(self.surface_width -| sel.width)))));
+            const clamped_y: u32 = @intCast(@max(0, @min(new_y, @as(i32, @intCast(self.surface_height -| sel.height)))));
+            self.selection = .{
+                .x = clamped_x,
+                .y = clamped_y,
+                .width = sel.width,
+                .height = sel.height,
+            };
+            self.scheduleRedraw();
+        }
     } else if (self.selection != null) {
-        // Update toolbar hover state
+        // Update toolbar hover state and cursor shape
         const prev_hovered = self.hovered_button;
         self.hovered_button = self.hitTestToolbar(self.current_x, self.current_y);
+        const in_selection = self.hitTestSelection(self.current_x, self.current_y);
 
         // Update cursor based on hover
         if (self.hovered_button != null and prev_hovered == null) {
             self.setCursorShape("hand2");
         } else if (self.hovered_button == null and prev_hovered != null) {
-            self.setCursor(self.pointer_serial);
+            if (in_selection) {
+                self.setCursorShape("grab");
+            } else {
+                self.setCursor(self.pointer_serial);
+            }
+        } else if (self.hovered_button == null) {
+            // Not over toolbar — show grab cursor inside selection, crosshair outside
+            if (in_selection) {
+                self.setCursorShape("grab");
+            } else {
+                self.setCursor(self.pointer_serial);
+            }
         }
 
         if ((self.hovered_button == null) != (prev_hovered == null) or
@@ -770,7 +810,18 @@ fn pointerButton(data: ?*anyopaque, _: ?*wl.c.wl_pointer, _: u32, _: u32, button
                 }
             }
 
-            // Start a new selection (even if one already exists)
+            // Check if clicking inside existing selection — start moving it
+            if (self.hitTestSelection(self.current_x, self.current_y)) {
+                const sel = self.selection.?;
+                self.moving = true;
+                self.move_offset_x = self.current_x - @as(i32, @intCast(sel.x));
+                self.move_offset_y = self.current_y - @as(i32, @intCast(sel.y));
+                self.hovered_button = null;
+                self.setCursorShape("grabbing");
+                return;
+            }
+
+            // Start a new selection
             self.selecting = true;
             self.selection = null;
             self.hovered_button = null;
@@ -779,7 +830,18 @@ fn pointerButton(data: ?*anyopaque, _: ?*wl.c.wl_pointer, _: u32, _: u32, button
             self.setCursor(self.pointer_serial); // restore crosshair
             self.scheduleRedraw();
         } else if (state == wl.c.WL_POINTER_BUTTON_STATE_RELEASED) {
-            if (self.selecting) {
+            if (self.moving) {
+                self.moving = false;
+                // Selection already updated during motion
+                if (self.hitTestSelection(self.current_x, self.current_y)) {
+                    self.setCursorShape("grab");
+                } else {
+                    self.setCursor(self.pointer_serial);
+                }
+                self.hovered_button = self.hitTestToolbar(self.current_x, self.current_y);
+                self.renderToBuffer();
+                self.commitBuffer();
+            } else if (self.selecting) {
                 self.selecting = false;
                 const sel = Rect.fromPoints(
                     self.start_x,
