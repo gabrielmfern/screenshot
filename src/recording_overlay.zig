@@ -281,31 +281,59 @@ pub const RecordingOverlay = struct {
         // Clear to fully transparent
         @memset(data, 0);
 
-        // Draw red border around recording region
-        self.drawRecordingBorder(data, stride);
+        // Darken the area outside the recording region
+        self.drawDarkenedOutside(data, stride);
 
         // Draw control bar
         self.drawControlBar(data, stride);
     }
 
-    fn drawRecordingBorder(self: *RecordingOverlay, data: []u8, stride: u32) void {
+    /// Fill everything outside the recording region with a semi-transparent dark overlay.
+    /// The recording region itself stays fully transparent (click-through, unobstructed).
+    fn drawDarkenedOutside(self: *RecordingOverlay, data: []u8, stride: u32) void {
         const r = self.region;
         const sw = self.surface_width;
         const sh = self.surface_height;
-        const border: u32 = 2;
+        const dim_alpha: u8 = 0x60; // ~38% opacity black
 
-        // Red border (BGRA: B=0x30, G=0x30, R=0xF0)
-        const max_x = @min(r.x + r.width, sw);
-        const max_y = @min(r.y + r.height, sh);
+        const rx_end = @min(r.x + r.width, sw);
+        const ry_end = @min(r.y + r.height, sh);
 
-        // Top
-        fillRect(data, stride, r.x, r.y -| border, r.width + border, border, sw, sh, 0xF0, 0x40, 0x40);
-        // Bottom
-        fillRect(data, stride, r.x, max_y, r.width + border, border, sw, sh, 0xF0, 0x40, 0x40);
-        // Left
-        fillRect(data, stride, r.x -| border, r.y -| border, border, r.height + border * 2, sw, sh, 0xF0, 0x40, 0x40);
-        // Right
-        fillRect(data, stride, max_x, r.y -| border, border, r.height + border * 2, sw, sh, 0xF0, 0x40, 0x40);
+        // Top band (full width, above region)
+        if (r.y > 0) {
+            fillRectAlpha(data, stride, 0, 0, sw, r.y, sw, sh, 0x00, 0x00, 0x00, dim_alpha);
+        }
+        // Bottom band (full width, below region)
+        if (ry_end < sh) {
+            fillRectAlpha(data, stride, 0, ry_end, sw, sh - ry_end, sw, sh, 0x00, 0x00, 0x00, dim_alpha);
+        }
+        // Left band (between top and bottom bands, left of region)
+        if (r.x > 0) {
+            fillRectAlpha(data, stride, 0, r.y, r.x, ry_end - r.y, sw, sh, 0x00, 0x00, 0x00, dim_alpha);
+        }
+        // Right band (between top and bottom bands, right of region)
+        if (rx_end < sw) {
+            fillRectAlpha(data, stride, rx_end, r.y, sw - rx_end, ry_end - r.y, sw, sh, 0x00, 0x00, 0x00, dim_alpha);
+        }
+    }
+
+    fn fillRectAlpha(data: []u8, stride: u32, rx: u32, ry: u32, rw: u32, rh: u32, sw: u32, sh: u32, r: u8, g: u8, b: u8, a: u8) void {
+        const x_end = @min(rx + rw, sw);
+        const y_end = @min(ry + rh, sh);
+        if (rx >= x_end or ry >= y_end) return;
+        const bpp = ShmBuffer.bpp;
+        for (ry..y_end) |y| {
+            const row_start = y * stride;
+            for (rx..x_end) |x| {
+                const offset = row_start + x * bpp;
+                if (offset + 3 < data.len) {
+                    data[offset + 0] = b;
+                    data[offset + 1] = g;
+                    data[offset + 2] = r;
+                    data[offset + 3] = a;
+                }
+            }
+        }
     }
 
     fn drawControlBar(self: *RecordingOverlay, data: []u8, stride: u32) void {
