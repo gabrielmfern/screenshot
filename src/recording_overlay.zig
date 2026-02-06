@@ -574,6 +574,37 @@ pub const RecordingOverlay = struct {
         };
     }
 
+    /// Non-blocking dispatch: flush outgoing requests and dispatch any pending events.
+    /// Returns true if an action was triggered (check self.action and self.done).
+    pub fn dispatchNonBlocking(self: *RecordingOverlay) !bool {
+        // Flush outgoing requests
+        _ = wl.c.wl_display_flush(self.display);
+
+        // Prepare to read events (non-blocking)
+        if (wl.c.wl_display_prepare_read(self.display) != 0) {
+            // There are events queued — dispatch them
+            _ = wl.c.wl_display_dispatch_pending(self.display);
+            return self.done;
+        }
+
+        // Use poll with a short timeout to check for incoming events
+        var pollfd = [1]posix.pollfd{.{
+            .fd = wl.c.wl_display_get_fd(self.display),
+            .events = posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = posix.poll(&pollfd, 0) catch 0; // timeout=0 for non-blocking
+
+        if (ready > 0) {
+            _ = wl.c.wl_display_read_events(self.display);
+            _ = wl.c.wl_display_dispatch_pending(self.display);
+        } else {
+            wl.c.wl_display_cancel_read(self.display);
+        }
+
+        return self.done;
+    }
+
     pub fn deinit(self: *RecordingOverlay) void {
         if (self.pointer) |ptr| wl.c.wl_pointer_destroy(ptr);
         if (self.cursor_surface) |s| wl.c.wl_surface_destroy(s);

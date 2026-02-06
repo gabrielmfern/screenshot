@@ -14,6 +14,12 @@ pub fn build(b: *std.Build) void {
     module.linkSystemLibrary("wayland-cursor", .{});
     module.linkSystemLibrary("xkbcommon", .{});
 
+    // FFmpeg libraries for video encoding
+    module.linkSystemLibrary("libavcodec", .{});
+    module.linkSystemLibrary("libavformat", .{});
+    module.linkSystemLibrary("libavutil", .{});
+    module.linkSystemLibrary("libswscale", .{});
+
     const Protocol = struct {
         name: []const u8,
         xmlPath: []const u8,

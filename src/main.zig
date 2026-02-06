@@ -428,12 +428,22 @@ pub fn main() !void {
                 return;
             };
 
-            // Start wf-recorder
+            // Start native Wayland recorder + ffmpeg encoder
             std.log.info("starting recording ({d}x{d} at {d},{d})", .{ sel.width, sel.height, sel.x, sel.y });
-            var recorder = Recorder.start(allocator, sel) catch |err| {
-                std.log.err("failed to start wf-recorder: {} (is wf-recorder installed?)", .{err});
+            var recorder = Recorder.start(
+                allocator,
+                sel,
+                wl_display.?,
+                wl_shm.?,
+                wl_output.?,
+                capture_manager,
+                source_manager,
+                screencopy_manager,
+            ) catch |err| {
+                std.log.err("failed to start recorder: {} (is ffmpeg installed?)", .{err});
                 return;
             };
+            defer recorder.deinit();
 
             // Show recording overlay
             var rec_overlay = RecordingOverlay{
@@ -447,35 +457,47 @@ pub fn main() !void {
             };
             try rec_overlay.init(allocator);
 
-            // Run the recording overlay event loop
-            while (true) {
-                const rec_result = try rec_overlay.run();
+            // Main recording loop: capture frames + handle overlay events
+            var recording = true;
+            while (recording) {
+                // Capture a frame and pipe to ffmpeg
+                if (!recorder.captureFrame()) {
+                    std.log.warn("frame capture failed, stopping recording", .{});
+                    break;
+                }
 
-                switch (rec_result.action) {
-                    .pause => {
-                        recorder.togglePause();
-                        if (recorder.paused) {
-                            std.log.info("recording paused", .{});
-                        } else {
-                            std.log.info("recording resumed", .{});
-                        }
-                        rec_overlay.done = false;
-                        rec_overlay.action = .none;
-                    },
-                    .stop => {
-                        break;
-                    },
-                    .none => break,
+                // Dispatch overlay events (non-blocking)
+                const action_triggered = rec_overlay.dispatchNonBlocking() catch break;
+
+                if (action_triggered) {
+                    switch (rec_overlay.action) {
+                        .pause => {
+                            recorder.togglePause();
+                            if (recorder.paused) {
+                                std.log.info("recording paused", .{});
+                            } else {
+                                std.log.info("recording resumed", .{});
+                            }
+                            rec_overlay.done = false;
+                            rec_overlay.action = .none;
+                        },
+                        .stop => {
+                            recording = false;
+                        },
+                        .none => {
+                            recording = false;
+                        },
+                    }
                 }
             }
 
             rec_overlay.deinit();
             _ = wl.c.wl_display_flush(wl_display);
 
-            // Stop wf-recorder
+            // Stop recorder (closes ffmpeg stdin, waits for muxing to finish)
             var stop_timer = Timer.start();
             recorder.stop();
-            std.log.info("wf-recorder stopped in {d:.1}ms", .{stop_timer.elapsedMs()});
+            std.log.info("recorder stopped in {d:.1}ms", .{stop_timer.elapsedMs()});
 
             // Move the recording to a permanent location
             stop_timer = Timer.start();
