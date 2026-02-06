@@ -421,12 +421,15 @@ pub fn main() !void {
             std.log.info("saved to {s} in {d:.1}ms", .{ owned_path, timer.elapsedMs() });
         },
         .record => {
+            const total_timer = Timer.start();
+
             const sel = result_selection orelse {
                 std.log.info("no selection for recording", .{});
                 return;
             };
 
             // Start wf-recorder
+            std.log.info("starting recording ({d}x{d} at {d},{d})", .{ sel.width, sel.height, sel.x, sel.y });
             var recorder = Recorder.start(allocator, sel) catch |err| {
                 std.log.err("failed to start wf-recorder: {} (is wf-recorder installed?)", .{err});
                 return;
@@ -445,14 +448,17 @@ pub fn main() !void {
             try rec_overlay.init(allocator);
 
             // Run the recording overlay event loop
-            // It returns when the user clicks pause or stop
             while (true) {
                 const rec_result = try rec_overlay.run();
 
                 switch (rec_result.action) {
                     .pause => {
                         recorder.togglePause();
-                        // Reset and continue the loop
+                        if (recorder.paused) {
+                            std.log.info("recording paused", .{});
+                        } else {
+                            std.log.info("recording resumed", .{});
+                        }
                         rec_overlay.done = false;
                         rec_overlay.action = .none;
                     },
@@ -467,22 +473,37 @@ pub fn main() !void {
             _ = wl.c.wl_display_flush(wl_display);
 
             // Stop wf-recorder
+            var stop_timer = Timer.start();
             recorder.stop();
+            std.log.info("wf-recorder stopped in {d:.1}ms", .{stop_timer.elapsedMs()});
 
             // Move the recording to a permanent location
+            stop_timer = Timer.start();
             const recording_path = generateRecordingPath(allocator) catch |err| {
                 std.log.err("failed to generate recording path: {}", .{err});
                 return;
             };
             defer allocator.free(recording_path);
 
+            const file_size = blk: {
+                const stat = std.fs.cwd().statFile(recorder.getOutputPath()) catch |err| {
+                    std.log.err("recording file not found: {}", .{err});
+                    return;
+                };
+                break :blk stat.size;
+            };
+
             std.fs.copyFileAbsolute(recorder.getOutputPath(), recording_path, .{}) catch |err| {
-                std.log.err("failed to move recording: {}", .{err});
+                std.log.err("failed to copy recording to {s}: {}", .{ recording_path, err });
                 return;
             };
             std.fs.deleteFileAbsolute(recorder.getOutputPath()) catch {};
 
+            const size_mb = @as(f64, @floatFromInt(file_size)) / (1024.0 * 1024.0);
+            std.log.info("saved to {s} ({d:.1} MB) in {d:.1}ms", .{ recording_path, size_mb, stop_timer.elapsedMs() });
+
             // Copy file path to clipboard as text/uri-list
+            stop_timer = Timer.start();
             const uri = std.fmt.allocPrint(allocator, "file://{s}\r\n", .{recording_path}) catch |err| {
                 std.log.err("failed to format URI: {}", .{err});
                 return;
@@ -494,7 +515,8 @@ pub fn main() !void {
                 return;
             };
             clipboard_forked = true;
-            std.log.info("recording saved to {s} and copied to clipboard", .{recording_path});
+            std.log.info("copied to clipboard in {d:.1}ms", .{stop_timer.elapsedMs()});
+            std.log.info("recording complete in {d:.1}ms total", .{total_timer.elapsedMs()});
         },
         .cancel => unreachable, // handled above
         .none => {
