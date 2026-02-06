@@ -69,30 +69,48 @@ pub const Audio = struct {
     // All samples are generated at comptime — zero runtime cost, no external files.
     // Mono, 16-bit signed, 44100 Hz.
 
-    /// Shutter click: noise burst with exponential decay (~150ms).
-    /// Mimics the mechanical sound of a camera shutter.
+    /// Shutter click: two-tap "ka-chick" (~100ms total).
+    /// First tap (shutter open) then a brief gap, then second tap (shutter close).
+    /// Each tap is a damped sine — like tapping a hard surface.
     const shutter_samples = blk: {
         @setEvalBranchQuota(500_000);
-        const duration_ms = 150;
+        const duration_ms = 100;
         const num_samples = SAMPLE_RATE * duration_ms / 1000;
         var samples: [num_samples]i16 = undefined;
 
-        // Simple LCG random for deterministic noise
-        var rng: u32 = 0xDEADBEEF;
+        // Tap timing (in samples)
+        const tap1_start = 0;
+        const tap1_len = SAMPLE_RATE * 12 / 1000; // 12ms
+        const gap = SAMPLE_RATE * 30 / 1000; // 30ms silence
+        const tap2_start = tap1_len + gap;
+        const tap2_len = SAMPLE_RATE * 15 / 1000; // 15ms
+
+        // Tap frequencies — slightly different to give the two-part character
+        const freq1: f64 = 1200.0; // first click, slightly lower
+        const freq2: f64 = 1500.0; // second click, slightly higher/brighter
+
         for (0..num_samples) |i| {
-            const t: f64 = @as(f64, @floatFromInt(i)) / SAMPLE_RATE;
+            var sample: f64 = 0.0;
 
-            // Gentler exponential decay envelope
-            const decay = @exp(-t * 30.0);
+            // First tap
+            if (i >= tap1_start and i < tap1_start + tap1_len) {
+                const ti = i - tap1_start;
+                const t: f64 = @as(f64, @floatFromInt(ti)) / SAMPLE_RATE;
+                // Sharp exponential decay
+                const env = @exp(-t * 350.0);
+                const sine = @sin(2.0 * std.math.pi * freq1 * t);
+                sample = sine * env * 0.25;
+            }
 
-            // Initial transient click (first 3ms is louder)
-            const transient = if (t < 0.003) 1.4 else 1.0;
+            // Second tap
+            if (i >= tap2_start and i < tap2_start + tap2_len) {
+                const ti = i - tap2_start;
+                const t: f64 = @as(f64, @floatFromInt(ti)) / SAMPLE_RATE;
+                const env = @exp(-t * 300.0);
+                const sine = @sin(2.0 * std.math.pi * freq2 * t);
+                sample = sine * env * 0.20;
+            }
 
-            // Generate noise via LCG
-            rng = rng *% 1103515245 +% 12345;
-            const noise_val: f64 = @as(f64, @floatFromInt(@as(i32, @bitCast(rng)))) / 2147483648.0;
-
-            const sample = noise_val * decay * transient * 0.18;
             samples[i] = floatToI16(sample);
         }
         break :blk samples;
