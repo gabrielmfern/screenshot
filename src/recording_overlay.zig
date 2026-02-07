@@ -91,7 +91,7 @@ pub const RecordingOverlay = struct {
         else if (self.region.y >= control_height + control_gap)
             self.region.y - control_height - control_gap
         else
-            self.region.y + self.region.height + 4;
+            self.region.y + self.region.height / 2 -| control_height / 2;
 
         return .{
             .x = clamped_x,
@@ -99,6 +99,13 @@ pub const RecordingOverlay = struct {
             .width = control_total_width,
             .height = control_height,
         };
+    }
+
+    fn controlBarInsideSelection(self: *const RecordingOverlay) bool {
+        const below_y = self.region.y + self.region.height + control_gap;
+        const fits_below = below_y + control_height <= self.surface_height;
+        const fits_above = self.region.y >= control_height + control_gap;
+        return !fits_below and !fits_above;
     }
 
     fn controlButtonRect(self: *const RecordingOverlay, btn: ControlButton) Rect {
@@ -344,6 +351,11 @@ pub const RecordingOverlay = struct {
         // Bar background
         fillRoundedRectAlpha(data, stride, bar.x, bar.y, bar.width, bar.height, sw, sh, control_corner_radius, 0x1A, 0x1A, 0x1A, 0xE0);
 
+        // Border for visibility when control bar is inside the recording region
+        if (self.controlBarInsideSelection()) {
+            strokeRoundedRect(data, stride, bar.x, bar.y, bar.width, bar.height, sw, sh, control_corner_radius, 2, 0xFF, 0xFF, 0xFF, 0x40);
+        }
+
         // Timer text
         const elapsed = self.getElapsedSeconds();
         const minutes = elapsed / 60;
@@ -543,6 +555,79 @@ pub const RecordingOverlay = struct {
                 if (in_rect) {
                     blendPixel(data, stride, @intCast(x), @intCast(y), r, g, b, a);
                 }
+            }
+        }
+    }
+
+    fn strokeRoundedRect(data: []u8, stride: u32, rx: u32, ry: u32, rw: u32, rh: u32, sw: u32, sh: u32, radius: u32, thickness: u32, r: u8, g: u8, b: u8, a: u8) void {
+        const x_end = @min(rx + rw, sw);
+        const y_end = @min(ry + rh, sh);
+        if (rx >= x_end or ry >= y_end) return;
+
+        const rad = @min(radius, @min(rw / 2, rh / 2));
+        const irad: i32 = @intCast(rad);
+        const irad_sq = irad * irad;
+        const ithick: i32 = @intCast(thickness);
+        const inner_rad = irad - ithick;
+        const inner_rad_sq = inner_rad * inner_rad;
+
+        for (ry..y_end) |y| {
+            for (rx..x_end) |x| {
+                const lx = @as(i32, @intCast(x)) - @as(i32, @intCast(rx));
+                const ly = @as(i32, @intCast(y)) - @as(i32, @intCast(ry));
+                const iw = @as(i32, @intCast(rw));
+                const ih = @as(i32, @intCast(rh));
+
+                var in_outer = true;
+                if (lx < irad and ly < irad) {
+                    const dx = irad - lx - 1;
+                    const dy = irad - ly - 1;
+                    if (dx * dx + dy * dy > irad_sq) in_outer = false;
+                } else if (lx >= iw - irad and ly < irad) {
+                    const dx = lx - (iw - irad);
+                    const dy = irad - ly - 1;
+                    if (dx * dx + dy * dy > irad_sq) in_outer = false;
+                } else if (lx < irad and ly >= ih - irad) {
+                    const dx = irad - lx - 1;
+                    const dy = ly - (ih - irad);
+                    if (dx * dx + dy * dy > irad_sq) in_outer = false;
+                } else if (lx >= iw - irad and ly >= ih - irad) {
+                    const dx = lx - (iw - irad);
+                    const dy = ly - (ih - irad);
+                    if (dx * dx + dy * dy > irad_sq) in_outer = false;
+                }
+                if (!in_outer) continue;
+
+                const in_inner = lx >= ithick and lx < iw - ithick and ly >= ithick and ly < ih - ithick;
+                if (in_inner) {
+                    const ilx = lx - ithick;
+                    const ily = ly - ithick;
+                    const iiw = iw - ithick * 2;
+                    const iih = ih - ithick * 2;
+                    var in_inner_round = true;
+                    if (inner_rad > 0) {
+                        if (ilx < inner_rad and ily < inner_rad) {
+                            const dx = inner_rad - ilx - 1;
+                            const dy = inner_rad - ily - 1;
+                            if (dx * dx + dy * dy > inner_rad_sq) in_inner_round = false;
+                        } else if (ilx >= iiw - inner_rad and ily < inner_rad) {
+                            const dx = ilx - (iiw - inner_rad);
+                            const dy = inner_rad - ily - 1;
+                            if (dx * dx + dy * dy > inner_rad_sq) in_inner_round = false;
+                        } else if (ilx < inner_rad and ily >= iih - inner_rad) {
+                            const dx = inner_rad - ilx - 1;
+                            const dy = ily - (iih - inner_rad);
+                            if (dx * dx + dy * dy > inner_rad_sq) in_inner_round = false;
+                        } else if (ilx >= iiw - inner_rad and ily >= iih - inner_rad) {
+                            const dx = ilx - (iiw - inner_rad);
+                            const dy = ily - (iih - inner_rad);
+                            if (dx * dx + dy * dy > inner_rad_sq) in_inner_round = false;
+                        }
+                    }
+                    if (in_inner_round) continue;
+                }
+
+                blendPixel(data, stride, @intCast(x), @intCast(y), r, g, b, a);
             }
         }
     }
