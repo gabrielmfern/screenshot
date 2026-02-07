@@ -103,14 +103,14 @@ pub const Overlay = struct {
             .record => clamped_x + button_size + button_spacing,
         };
 
-        // Place below selection, or above if no room
+        // Place below selection, above if no room, or centered in selection as last resort
         const below_y = sel.y + sel.height + toolbar_gap;
         const by = if (below_y + button_size <= self.surface_height)
             below_y
         else if (sel.y >= button_size + toolbar_gap)
             sel.y - button_size - toolbar_gap
         else
-            return null;
+            sel.y + sel.height / 2 -| button_size / 2;
 
         return Rect{
             .x = bx,
