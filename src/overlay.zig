@@ -94,6 +94,10 @@ pub const Overlay = struct {
         top_right,
         bottom_left,
         bottom_right,
+        top,
+        bottom,
+        left,
+        right,
     };
 
     // ── Toolbar layout constants ────────────────────────────────────
@@ -165,8 +169,9 @@ pub const Overlay = struct {
     }
 
     const corner_grab_radius: u32 = 16; // how close to a corner to trigger resize
+    const edge_grab_thickness: u32 = 8; // how close to an edge to trigger resize
 
-    fn hitTestCorner(self: *const Overlay, px: i32, py: i32) ?ResizeEdge {
+    fn hitTestResize(self: *const Overlay, px: i32, py: i32) ?ResizeEdge {
         const sel = self.selection orelse return null;
         if (px < 0 or py < 0) return null;
 
@@ -176,7 +181,7 @@ pub const Overlay = struct {
         const sy2 = sy + @as(i32, @intCast(sel.height));
         const r = @as(i32, @intCast(corner_grab_radius));
 
-        // Check each corner — return the closest one within grab radius
+        // Check corners first (higher priority) — closest within grab radius
         const corners = [_]struct { edge: ResizeEdge, cx: i32, cy: i32 }{
             .{ .edge = .top_left, .cx = sx, .cy = sy },
             .{ .edge = .top_right, .cx = sx2, .cy = sy },
@@ -197,7 +202,24 @@ pub const Overlay = struct {
             }
         }
 
-        return best_edge;
+        if (best_edge != null) return best_edge;
+
+        // Check edges — pointer must be within edge_grab_thickness of the edge
+        // and within the selection span on the other axis (excluding corner zones)
+        const t = @as(i32, @intCast(edge_grab_thickness));
+        const on_top = (py >= sy - t and py <= sy + t);
+        const on_bottom = (py >= sy2 - t and py <= sy2 + t);
+        const on_left = (px >= sx - t and px <= sx + t);
+        const on_right = (px >= sx2 - t and px <= sx2 + t);
+        const in_x_span = (px > sx + r and px < sx2 - r);
+        const in_y_span = (py > sy + r and py < sy2 - r);
+
+        if (on_top and in_x_span) return .top;
+        if (on_bottom and in_x_span) return .bottom;
+        if (on_left and in_y_span) return .left;
+        if (on_right and in_y_span) return .right;
+
+        return null;
     }
 
     fn cursorForEdge(edge: ResizeEdge) [*:0]const u8 {
@@ -206,6 +228,10 @@ pub const Overlay = struct {
             .top_right => "top_right_corner",
             .bottom_left => "bottom_left_corner",
             .bottom_right => "bottom_right_corner",
+            .top => "top_side",
+            .bottom => "bottom_side",
+            .left => "left_side",
+            .right => "right_side",
         };
     }
 
@@ -900,12 +926,22 @@ fn pointerMotion(data: ?*anyopaque, _: ?*wl.c.wl_pointer, _: u32, sx: wl.c.wl_fi
             self.scheduleRedraw();
         }
     } else if (self.resizing) {
-        // Resize the selection: anchor stays fixed, dragged corner follows pointer
+        // Resize the selection: anchor stays fixed, dragged side/corner follows pointer
+        // For edge drags, constrain the axis parallel to the edge
+        const sel = self.selection orelse return;
+        const drag_x = switch (self.resize_edge) {
+            .top, .bottom => self.resize_anchor_x + @as(i32, @intCast(sel.width)),
+            else => self.current_x,
+        };
+        const drag_y = switch (self.resize_edge) {
+            .left, .right => self.resize_anchor_y + @as(i32, @intCast(sel.height)),
+            else => self.current_y,
+        };
         const new_sel = Rect.fromPoints(
             self.resize_anchor_x,
             self.resize_anchor_y,
-            self.current_x,
-            self.current_y,
+            drag_x,
+            drag_y,
         );
         if (!new_sel.isEmpty()) {
             self.selection = new_sel;
@@ -915,7 +951,7 @@ fn pointerMotion(data: ?*anyopaque, _: ?*wl.c.wl_pointer, _: u32, sx: wl.c.wl_fi
         // Update toolbar hover state and cursor shape
         const prev_hovered = self.hovered_button;
         self.hovered_button = self.hitTestToolbar(self.current_x, self.current_y);
-        const on_corner = self.hitTestCorner(self.current_x, self.current_y);
+        const on_corner = self.hitTestResize(self.current_x, self.current_y);
         const in_selection = self.hitTestSelection(self.current_x, self.current_y);
 
         // Update cursor based on hover
@@ -961,12 +997,12 @@ fn pointerButton(data: ?*anyopaque, _: ?*wl.c.wl_pointer, _: u32, _: u32, button
                 }
             }
 
-            // Check if clicking near a corner — start resizing
-            if (self.hitTestCorner(self.current_x, self.current_y)) |edge| {
+            // Check if clicking near a corner or edge — start resizing
+            if (self.hitTestResize(self.current_x, self.current_y)) |edge| {
                 const sel = self.selection.?;
                 self.resizing = true;
                 self.resize_edge = edge;
-                // Anchor is the corner opposite to the one being dragged
+                // Anchor is the opposite side/corner from the one being dragged
                 switch (edge) {
                     .top_left => {
                         self.resize_anchor_x = @intCast(sel.x + sel.width);
@@ -981,6 +1017,22 @@ fn pointerButton(data: ?*anyopaque, _: ?*wl.c.wl_pointer, _: u32, _: u32, button
                         self.resize_anchor_y = @intCast(sel.y);
                     },
                     .bottom_right => {
+                        self.resize_anchor_x = @intCast(sel.x);
+                        self.resize_anchor_y = @intCast(sel.y);
+                    },
+                    .top => {
+                        self.resize_anchor_x = @intCast(sel.x);
+                        self.resize_anchor_y = @intCast(sel.y + sel.height);
+                    },
+                    .bottom => {
+                        self.resize_anchor_x = @intCast(sel.x);
+                        self.resize_anchor_y = @intCast(sel.y);
+                    },
+                    .left => {
+                        self.resize_anchor_x = @intCast(sel.x + sel.width);
+                        self.resize_anchor_y = @intCast(sel.y);
+                    },
+                    .right => {
                         self.resize_anchor_x = @intCast(sel.x);
                         self.resize_anchor_y = @intCast(sel.y);
                     },
@@ -1013,7 +1065,7 @@ fn pointerButton(data: ?*anyopaque, _: ?*wl.c.wl_pointer, _: u32, _: u32, button
             if (self.resizing) {
                 self.resizing = false;
                 // Selection already updated during motion
-                if (self.hitTestCorner(self.current_x, self.current_y)) |edge| {
+                if (self.hitTestResize(self.current_x, self.current_y)) |edge| {
                     self.setCursorShape(Overlay.cursorForEdge(edge));
                 } else if (self.hitTestSelection(self.current_x, self.current_y)) {
                     self.setCursorShape("grab");
@@ -1026,7 +1078,7 @@ fn pointerButton(data: ?*anyopaque, _: ?*wl.c.wl_pointer, _: u32, _: u32, button
             } else if (self.moving) {
                 self.moving = false;
                 // Selection already updated during motion
-                if (self.hitTestCorner(self.current_x, self.current_y)) |edge| {
+                if (self.hitTestResize(self.current_x, self.current_y)) |edge| {
                     self.setCursorShape(Overlay.cursorForEdge(edge));
                 } else if (self.hitTestSelection(self.current_x, self.current_y)) {
                     self.setCursorShape("grab");
