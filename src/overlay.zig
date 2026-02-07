@@ -120,6 +120,14 @@ pub const Overlay = struct {
         };
     }
 
+    fn toolbarInsideSelection(self: *const Overlay) bool {
+        const sel = self.selection orelse return false;
+        const below_y = sel.y + sel.height + toolbar_gap;
+        const fits_below = below_y + button_size <= self.surface_height;
+        const fits_above = sel.y >= button_size + toolbar_gap;
+        return !fits_below and !fits_above;
+    }
+
     fn hitTestSelection(self: *const Overlay, px: i32, py: i32) bool {
         const sel = self.selection orelse return false;
         if (px < 0 or py < 0) return false;
@@ -536,6 +544,82 @@ pub const Overlay = struct {
         }
     }
 
+    fn strokeRoundedRect(data: []u8, stride: u32, rx: u32, ry: u32, rw: u32, rh: u32, sw: u32, sh: u32, radius: u32, thickness: u32, r: u8, g: u8, b: u8, a: u8) void {
+        const x_end = @min(rx + rw, sw);
+        const y_end = @min(ry + rh, sh);
+        if (rx >= x_end or ry >= y_end) return;
+
+        const rad = @min(radius, @min(rw / 2, rh / 2));
+        const irad: i32 = @intCast(rad);
+        const irad_sq = irad * irad;
+        const ithick: i32 = @intCast(thickness);
+        const inner_rad = irad - ithick;
+        const inner_rad_sq = inner_rad * inner_rad;
+
+        for (ry..y_end) |y| {
+            for (rx..x_end) |x| {
+                const lx = @as(i32, @intCast(x)) - @as(i32, @intCast(rx));
+                const ly = @as(i32, @intCast(y)) - @as(i32, @intCast(ry));
+                const iw = @as(i32, @intCast(rw));
+                const ih = @as(i32, @intCast(rh));
+
+                // Check if pixel is inside the rounded rect at all
+                var in_outer = true;
+                if (lx < irad and ly < irad) {
+                    const dx = irad - lx - 1;
+                    const dy = irad - ly - 1;
+                    if (dx * dx + dy * dy > irad_sq) in_outer = false;
+                } else if (lx >= iw - irad and ly < irad) {
+                    const dx = lx - (iw - irad);
+                    const dy = irad - ly - 1;
+                    if (dx * dx + dy * dy > irad_sq) in_outer = false;
+                } else if (lx < irad and ly >= ih - irad) {
+                    const dx = irad - lx - 1;
+                    const dy = ly - (ih - irad);
+                    if (dx * dx + dy * dy > irad_sq) in_outer = false;
+                } else if (lx >= iw - irad and ly >= ih - irad) {
+                    const dx = lx - (iw - irad);
+                    const dy = ly - (ih - irad);
+                    if (dx * dx + dy * dy > irad_sq) in_outer = false;
+                }
+                if (!in_outer) continue;
+
+                // Check if pixel is inside the inner (shrunk) rect — if so, skip (not on border)
+                const in_inner = lx >= ithick and lx < iw - ithick and ly >= ithick and ly < ih - ithick;
+                if (in_inner) {
+                    // Still need to check corners of the inner rounded rect
+                    const ilx = lx - ithick;
+                    const ily = ly - ithick;
+                    const iiw = iw - ithick * 2;
+                    const iih = ih - ithick * 2;
+                    var in_inner_round = true;
+                    if (inner_rad > 0) {
+                        if (ilx < inner_rad and ily < inner_rad) {
+                            const dx = inner_rad - ilx - 1;
+                            const dy = inner_rad - ily - 1;
+                            if (dx * dx + dy * dy > inner_rad_sq) in_inner_round = false;
+                        } else if (ilx >= iiw - inner_rad and ily < inner_rad) {
+                            const dx = ilx - (iiw - inner_rad);
+                            const dy = inner_rad - ily - 1;
+                            if (dx * dx + dy * dy > inner_rad_sq) in_inner_round = false;
+                        } else if (ilx < inner_rad and ily >= iih - inner_rad) {
+                            const dx = inner_rad - ilx - 1;
+                            const dy = ily - (iih - inner_rad);
+                            if (dx * dx + dy * dy > inner_rad_sq) in_inner_round = false;
+                        } else if (ilx >= iiw - inner_rad and ily >= iih - inner_rad) {
+                            const dx = ilx - (iiw - inner_rad);
+                            const dy = ily - (iih - inner_rad);
+                            if (dx * dx + dy * dy > inner_rad_sq) in_inner_round = false;
+                        }
+                    }
+                    if (in_inner_round) continue;
+                }
+
+                blendPixel(data, stride, @intCast(x), @intCast(y), r, g, b, a);
+            }
+        }
+    }
+
     fn drawCircle(data: []u8, stride: u32, cx: i32, cy: i32, radius: i32, sw: u32, sh: u32, r: u8, g: u8, b: u8, thickness: i32) void {
         const outer_r_sq = radius * radius;
         const inner_r = radius - thickness;
@@ -630,6 +714,11 @@ pub const Overlay = struct {
                     fillRoundedRectAlpha(data, stride, br.x, br.y, br.width, br.height, sw, sh, button_corner_radius, 0x50, 0x50, 0x50, 0xE0);
                 } else {
                     fillRoundedRectAlpha(data, stride, br.x, br.y, br.width, br.height, sw, sh, button_corner_radius, 0x1E, 0x1E, 0x1E, 0xD8);
+                }
+
+                // Border for visibility when buttons are inside the selection
+                if (self.toolbarInsideSelection()) {
+                    strokeRoundedRect(data, stride, br.x, br.y, br.width, br.height, sw, sh, button_corner_radius, 2, 0xFF, 0xFF, 0xFF, 0x40);
                 }
 
                 // Icon centered in button
