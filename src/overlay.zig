@@ -50,6 +50,10 @@ pub const Overlay = struct {
     // Selection state
     selecting: bool = false,
     moving: bool = false,
+    resizing: bool = false,
+    resize_edge: ResizeEdge = .top_left,
+    resize_anchor_x: i32 = 0, // the fixed corner opposite to the dragged one
+    resize_anchor_y: i32 = 0,
     start_x: i32 = 0,
     start_y: i32 = 0,
     current_x: i32 = 0,
@@ -83,6 +87,13 @@ pub const Overlay = struct {
     pub const ToolbarButton = enum {
         screenshot,
         record,
+    };
+
+    pub const ResizeEdge = enum {
+        top_left,
+        top_right,
+        bottom_left,
+        bottom_right,
     };
 
     // ── Toolbar layout constants ────────────────────────────────────
@@ -151,6 +162,51 @@ pub const Overlay = struct {
             }
         }
         return null;
+    }
+
+    const corner_grab_radius: u32 = 16; // how close to a corner to trigger resize
+
+    fn hitTestCorner(self: *const Overlay, px: i32, py: i32) ?ResizeEdge {
+        const sel = self.selection orelse return null;
+        if (px < 0 or py < 0) return null;
+
+        const sx = @as(i32, @intCast(sel.x));
+        const sy = @as(i32, @intCast(sel.y));
+        const sx2 = sx + @as(i32, @intCast(sel.width));
+        const sy2 = sy + @as(i32, @intCast(sel.height));
+        const r = @as(i32, @intCast(corner_grab_radius));
+
+        // Check each corner — return the closest one within grab radius
+        const corners = [_]struct { edge: ResizeEdge, cx: i32, cy: i32 }{
+            .{ .edge = .top_left, .cx = sx, .cy = sy },
+            .{ .edge = .top_right, .cx = sx2, .cy = sy },
+            .{ .edge = .bottom_left, .cx = sx, .cy = sy2 },
+            .{ .edge = .bottom_right, .cx = sx2, .cy = sy2 },
+        };
+
+        var best_edge: ?ResizeEdge = null;
+        var best_dist: i32 = r * r + 1;
+
+        for (corners) |corner| {
+            const dx = px - corner.cx;
+            const dy = py - corner.cy;
+            const dist = dx * dx + dy * dy;
+            if (dist < best_dist) {
+                best_dist = dist;
+                best_edge = corner.edge;
+            }
+        }
+
+        return best_edge;
+    }
+
+    fn cursorForEdge(edge: ResizeEdge) [*:0]const u8 {
+        return switch (edge) {
+            .top_left => "top_left_corner",
+            .top_right => "top_right_corner",
+            .bottom_left => "bottom_left_corner",
+            .bottom_right => "bottom_right_corner",
+        };
     }
 
     pub fn init(self: *Overlay, allocator: std.mem.Allocator) !void {
@@ -357,8 +413,8 @@ pub const Overlay = struct {
         self.drawSelectionBorder(data, stride, clamped);
         self.drawHandles(data, stride, clamped);
 
-        // Draw toolbar below selection (only when selection is locked in, not while dragging)
-        if (!self.selecting and self.selection != null) {
+        // Draw toolbar below selection (only when selection is locked in, not while dragging/resizing)
+        if (!self.selecting and !self.resizing and self.selection != null) {
             self.drawToolbar(data, stride);
         }
     }
@@ -777,7 +833,7 @@ fn frameCallback(data: ?*anyopaque, cb: ?*wl.c.wl_callback, _: u32) callconv(.c)
         self.renderToBuffer();
         self.commitBuffer();
 
-        if (self.selecting or self.moving) {
+        if (self.selecting or self.moving or self.resizing) {
             self.scheduleRedraw();
         }
     }
@@ -843,28 +899,34 @@ fn pointerMotion(data: ?*anyopaque, _: ?*wl.c.wl_pointer, _: u32, sx: wl.c.wl_fi
             };
             self.scheduleRedraw();
         }
+    } else if (self.resizing) {
+        // Resize the selection: anchor stays fixed, dragged corner follows pointer
+        const new_sel = Rect.fromPoints(
+            self.resize_anchor_x,
+            self.resize_anchor_y,
+            self.current_x,
+            self.current_y,
+        );
+        if (!new_sel.isEmpty()) {
+            self.selection = new_sel;
+            self.scheduleRedraw();
+        }
     } else if (self.selection != null) {
         // Update toolbar hover state and cursor shape
         const prev_hovered = self.hovered_button;
         self.hovered_button = self.hitTestToolbar(self.current_x, self.current_y);
+        const on_corner = self.hitTestCorner(self.current_x, self.current_y);
         const in_selection = self.hitTestSelection(self.current_x, self.current_y);
 
         // Update cursor based on hover
-        if (self.hovered_button != null and prev_hovered == null) {
-            self.setCursorShape("hand2");
-        } else if (self.hovered_button == null and prev_hovered != null) {
-            if (in_selection) {
-                self.setCursorShape("grab");
-            } else {
-                self.setCursor(self.pointer_serial);
-            }
-        } else if (self.hovered_button == null) {
-            // Not over toolbar — show grab cursor inside selection, crosshair outside
-            if (in_selection) {
-                self.setCursorShape("grab");
-            } else {
-                self.setCursor(self.pointer_serial);
-            }
+        if (self.hovered_button != null) {
+            if (prev_hovered == null) self.setCursorShape("hand2");
+        } else if (on_corner) |edge| {
+            self.setCursorShape(Overlay.cursorForEdge(edge));
+        } else if (in_selection) {
+            self.setCursorShape("grab");
+        } else {
+            self.setCursor(self.pointer_serial);
         }
 
         if ((self.hovered_button == null) != (prev_hovered == null) or
@@ -899,6 +961,35 @@ fn pointerButton(data: ?*anyopaque, _: ?*wl.c.wl_pointer, _: u32, _: u32, button
                 }
             }
 
+            // Check if clicking near a corner — start resizing
+            if (self.hitTestCorner(self.current_x, self.current_y)) |edge| {
+                const sel = self.selection.?;
+                self.resizing = true;
+                self.resize_edge = edge;
+                // Anchor is the corner opposite to the one being dragged
+                switch (edge) {
+                    .top_left => {
+                        self.resize_anchor_x = @intCast(sel.x + sel.width);
+                        self.resize_anchor_y = @intCast(sel.y + sel.height);
+                    },
+                    .top_right => {
+                        self.resize_anchor_x = @intCast(sel.x);
+                        self.resize_anchor_y = @intCast(sel.y + sel.height);
+                    },
+                    .bottom_left => {
+                        self.resize_anchor_x = @intCast(sel.x + sel.width);
+                        self.resize_anchor_y = @intCast(sel.y);
+                    },
+                    .bottom_right => {
+                        self.resize_anchor_x = @intCast(sel.x);
+                        self.resize_anchor_y = @intCast(sel.y);
+                    },
+                }
+                self.hovered_button = null;
+                self.setCursorShape(Overlay.cursorForEdge(edge));
+                return;
+            }
+
             // Check if clicking inside existing selection — start moving it
             if (self.hitTestSelection(self.current_x, self.current_y)) {
                 const sel = self.selection.?;
@@ -919,10 +1010,25 @@ fn pointerButton(data: ?*anyopaque, _: ?*wl.c.wl_pointer, _: u32, _: u32, button
             self.setCursor(self.pointer_serial); // restore crosshair
             self.scheduleRedraw();
         } else if (state == wl.c.WL_POINTER_BUTTON_STATE_RELEASED) {
-            if (self.moving) {
+            if (self.resizing) {
+                self.resizing = false;
+                // Selection already updated during motion
+                if (self.hitTestCorner(self.current_x, self.current_y)) |edge| {
+                    self.setCursorShape(Overlay.cursorForEdge(edge));
+                } else if (self.hitTestSelection(self.current_x, self.current_y)) {
+                    self.setCursorShape("grab");
+                } else {
+                    self.setCursor(self.pointer_serial);
+                }
+                self.hovered_button = self.hitTestToolbar(self.current_x, self.current_y);
+                self.renderToBuffer();
+                self.commitBuffer();
+            } else if (self.moving) {
                 self.moving = false;
                 // Selection already updated during motion
-                if (self.hitTestSelection(self.current_x, self.current_y)) {
+                if (self.hitTestCorner(self.current_x, self.current_y)) |edge| {
+                    self.setCursorShape(Overlay.cursorForEdge(edge));
+                } else if (self.hitTestSelection(self.current_x, self.current_y)) {
                     self.setCursorShape("grab");
                 } else {
                     self.setCursor(self.pointer_serial);
