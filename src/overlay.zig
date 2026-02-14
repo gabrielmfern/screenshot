@@ -316,10 +316,20 @@ pub const Overlay = struct {
         const bg = self.dark_bg.?;
         const bpp = ShmBuffer.bpp;
 
-        for (0..self.surface_height) |y| {
-            for (0..self.surface_width) |x| {
-                const dst_offset = y * stride + x * bpp;
-                const src_offset = y * self.screenshot.stride + x * Image.bpp;
+        const same_dimensions =
+            self.surface_width == self.screenshot.width and
+            self.surface_height == self.screenshot.height;
+
+        for (0..self.surface_height) |yy| {
+            const y: u32 = @intCast(yy);
+            const src_y = if (same_dimensions) y else self.mapSurfaceToScreenshotY(y);
+
+            for (0..self.surface_width) |xx| {
+                const x: u32 = @intCast(xx);
+                const src_x = if (same_dimensions) x else self.mapSurfaceToScreenshotX(x);
+
+                const dst_offset = @as(usize, y) * stride + @as(usize, x) * bpp;
+                const src_offset = @as(usize, src_y) * self.screenshot.stride + @as(usize, src_x) * Image.bpp;
 
                 if (src_offset + 3 < self.screenshot.data.len and dst_offset + 3 < bg.len) {
                     bg[dst_offset + 0] = self.screenshot.data[src_offset + 0] / 3;
@@ -329,6 +339,20 @@ pub const Overlay = struct {
                 }
             }
         }
+    }
+
+    fn mapSurfaceToScreenshotX(self: *const Overlay, x: u32) u32 {
+        return mapCoordFloor(x, self.surface_width, self.screenshot.width);
+    }
+
+    fn mapSurfaceToScreenshotY(self: *const Overlay, y: u32) u32 {
+        return mapCoordFloor(y, self.surface_height, self.screenshot.height);
+    }
+
+    fn mapCoordFloor(coord: u32, src_extent: u32, dst_extent: u32) u32 {
+        if (src_extent == 0 or dst_extent == 0) return 0;
+        const mapped: u64 = (@as(u64, coord) * dst_extent) / src_extent;
+        return @intCast(@min(mapped, @as(u64, dst_extent - 1)));
     }
 
     fn setCursor(self: *Overlay, serial: u32) void {
@@ -413,24 +437,48 @@ pub const Overlay = struct {
 
         const bpp = ShmBuffer.bpp;
 
-        // Restore original brightness only inside the selection rectangle
-        for (clamped.y..clamped.y + clamped.height) |y| {
-            const dst_row_start = y * stride + clamped.x * bpp;
-            const src_row_start = y * self.screenshot.stride + clamped.x * Image.bpp;
-            const row_bytes = clamped.width * bpp;
+        const same_dimensions =
+            self.surface_width == self.screenshot.width and
+            self.surface_height == self.screenshot.height;
 
-            if (src_row_start + row_bytes <= self.screenshot.data.len and
-                dst_row_start + row_bytes <= data.len)
-            {
-                @memcpy(
-                    data[dst_row_start..][0..row_bytes],
-                    self.screenshot.data[src_row_start..][0..row_bytes],
-                );
-                // Fix alpha channel (screenshot might be XRGB with alpha=0)
-                var x: usize = dst_row_start;
-                const end = dst_row_start + row_bytes;
-                while (x + 3 < end) : (x += bpp) {
-                    data[x + 3] = 0xFF;
+        // Restore original brightness only inside the selection rectangle
+        for (clamped.y..clamped.y + clamped.height) |yy| {
+            const y: u32 = @intCast(yy);
+
+            if (same_dimensions) {
+                const dst_row_start = @as(usize, y) * stride + @as(usize, clamped.x) * bpp;
+                const src_row_start = @as(usize, y) * self.screenshot.stride + @as(usize, clamped.x) * Image.bpp;
+                const row_bytes = @as(usize, clamped.width) * bpp;
+
+                if (src_row_start + row_bytes <= self.screenshot.data.len and
+                    dst_row_start + row_bytes <= data.len)
+                {
+                    @memcpy(
+                        data[dst_row_start..][0..row_bytes],
+                        self.screenshot.data[src_row_start..][0..row_bytes],
+                    );
+                    // Fix alpha channel (screenshot might be XRGB with alpha=0)
+                    var x: usize = dst_row_start;
+                    const end = dst_row_start + row_bytes;
+                    while (x + 3 < end) : (x += bpp) {
+                        data[x + 3] = 0xFF;
+                    }
+                }
+            } else {
+                const src_y = self.mapSurfaceToScreenshotY(y);
+                for (clamped.x..clamped.x + clamped.width) |xx| {
+                    const x: u32 = @intCast(xx);
+                    const src_x = self.mapSurfaceToScreenshotX(x);
+
+                    const dst_offset = @as(usize, y) * stride + @as(usize, x) * bpp;
+                    const src_offset = @as(usize, src_y) * self.screenshot.stride + @as(usize, src_x) * Image.bpp;
+
+                    if (src_offset + 3 < self.screenshot.data.len and dst_offset + 3 < data.len) {
+                        data[dst_offset + 0] = self.screenshot.data[src_offset + 0];
+                        data[dst_offset + 1] = self.screenshot.data[src_offset + 1];
+                        data[dst_offset + 2] = self.screenshot.data[src_offset + 2];
+                        data[dst_offset + 3] = 0xFF;
+                    }
                 }
             }
         }
@@ -818,6 +866,8 @@ pub const Overlay = struct {
         selection: ?Rect,
         action: Action,
         serial: u32,
+        surface_width: u32,
+        surface_height: u32,
     };
 
     pub fn run(self: *Overlay) !Result {
@@ -830,6 +880,8 @@ pub const Overlay = struct {
             .selection = self.selection,
             .action = self.action,
             .serial = self.pointer_serial,
+            .surface_width = self.surface_width,
+            .surface_height = self.surface_height,
         };
     }
 

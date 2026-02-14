@@ -252,6 +252,39 @@ const Mode = enum {
     region,
 };
 
+fn mapRectBetweenSpaces(rect: Rect, src_width: u32, src_height: u32, dst_width: u32, dst_height: u32) Rect {
+    if (rect.isEmpty() or src_width == 0 or src_height == 0 or dst_width == 0 or dst_height == 0) {
+        return .{ .x = 0, .y = 0, .width = 0, .height = 0 };
+    }
+
+    const x1 = scaleFloor(rect.x, src_width, dst_width);
+    const y1 = scaleFloor(rect.y, src_height, dst_height);
+    const x2 = scaleCeil(rect.x +| rect.width, src_width, dst_width);
+    const y2 = scaleCeil(rect.y +| rect.height, src_height, dst_height);
+
+    const clamped_x1 = @min(x1, dst_width);
+    const clamped_y1 = @min(y1, dst_height);
+    const clamped_x2 = @min(x2, dst_width);
+    const clamped_y2 = @min(y2, dst_height);
+
+    return .{
+        .x = clamped_x1,
+        .y = clamped_y1,
+        .width = clamped_x2 -| clamped_x1,
+        .height = clamped_y2 -| clamped_y1,
+    };
+}
+
+fn scaleFloor(coord: u32, src_extent: u32, dst_extent: u32) u32 {
+    const scaled: u64 = (@as(u64, coord) * dst_extent) / src_extent;
+    return @intCast(scaled);
+}
+
+fn scaleCeil(coord: u32, src_extent: u32, dst_extent: u32) u32 {
+    const scaled: u64 = (@as(u64, coord) * dst_extent + src_extent - 1) / src_extent;
+    return @intCast(scaled);
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer {
@@ -354,7 +387,8 @@ pub fn main() !void {
     defer if (cropped_image) |*img| img.deinit();
 
     var action: Overlay.Action = .save_to_file; // default for fullscreen mode
-    var result_selection: ?Rect = null; // raw selection rect for recording
+    var overlay_selection: ?Rect = null; // selection in overlay surface coordinates
+    var capture_selection: ?Rect = null; // selection mapped to capture buffer coordinates
 
     if (mode == .region) {
         if (wl_seat == null) return error.MissingSeat;
@@ -388,8 +422,20 @@ pub fn main() !void {
         }
 
         if (result.selection) |sel| {
-            result_selection = sel;
-            cropped_image = try screenshot.crop(allocator, sel);
+            overlay_selection = sel;
+            const mapped_sel = mapRectBetweenSpaces(
+                sel,
+                result.surface_width,
+                result.surface_height,
+                screenshot.width,
+                screenshot.height,
+            );
+            if (mapped_sel.isEmpty()) {
+                std.log.info("selection mapped to empty region", .{});
+                return;
+            }
+            capture_selection = mapped_sel;
+            cropped_image = try screenshot.crop(allocator, mapped_sel);
         } else {
             std.log.info("no selection made", .{});
             return;
@@ -426,16 +472,17 @@ pub fn main() !void {
         .record => {
             const total_timer = Timer.start();
 
-            const sel = result_selection orelse {
+            const overlay_sel = overlay_selection orelse {
                 std.log.info("no selection for recording", .{});
                 return;
             };
+            const capture_sel = capture_selection orelse overlay_sel;
 
             // Start native Wayland recorder + ffmpeg encoder
-            std.log.info("starting recording ({d}x{d} at {d},{d})", .{ sel.width, sel.height, sel.x, sel.y });
+            std.log.info("starting recording ({d}x{d} at {d},{d})", .{ capture_sel.width, capture_sel.height, capture_sel.x, capture_sel.y });
             var recorder = Recorder.start(
                 allocator,
-                sel,
+                capture_sel,
                 wl_display.?,
                 wl_shm.?,
                 wl_output.?,
@@ -458,7 +505,7 @@ pub fn main() !void {
                 .seat = wl_seat.?,
                 .layer_shell = layer_shell.?,
                 .output = wl_output.?,
-                .region = sel,
+                .region = overlay_sel,
             };
             try rec_overlay.init(allocator);
 
@@ -575,6 +622,27 @@ test "generateOutputPath produces valid filename with resolution and date" {
     try std.testing.expect(std.mem.indexOf(u8, path, "screenshot-1920x1080-") != null);
     // Should contain underscore separating date from time
     try std.testing.expect(std.mem.indexOf(u8, path, "_") != null);
+}
+
+test "mapRectBetweenSpaces maps logical region to physical pixels" {
+    // 1.25x scale: 1536x864 logical -> 1920x1080 physical
+    const logical = Rect{ .x = 100, .y = 50, .width = 200, .height = 100 };
+    const mapped = mapRectBetweenSpaces(logical, 1536, 864, 1920, 1080);
+
+    try std.testing.expectEqual(@as(u32, 125), mapped.x);
+    try std.testing.expectEqual(@as(u32, 62), mapped.y);
+    try std.testing.expectEqual(@as(u32, 250), mapped.width);
+    try std.testing.expectEqual(@as(u32, 126), mapped.height);
+}
+
+test "mapRectBetweenSpaces clamps to destination bounds" {
+    const logical = Rect{ .x = 900, .y = 700, .width = 200, .height = 100 };
+    const mapped = mapRectBetweenSpaces(logical, 1000, 800, 1920, 1080);
+
+    try std.testing.expectEqual(@as(u32, 1728), mapped.x);
+    try std.testing.expectEqual(@as(u32, 945), mapped.y);
+    try std.testing.expectEqual(@as(u32, 192), mapped.width);
+    try std.testing.expectEqual(@as(u32, 135), mapped.height);
 }
 
 test "generateOutputPath different resolutions" {
