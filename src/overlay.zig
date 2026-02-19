@@ -82,11 +82,13 @@ pub const Overlay = struct {
         save_to_file,
         take_screenshot,
         record,
+        start_scrolling_capture,
     };
 
     pub const ToolbarButton = enum {
         screenshot,
         record,
+        scroll_screenshot,
     };
 
     pub const ResizeEdge = enum {
@@ -108,7 +110,7 @@ pub const Overlay = struct {
 
     fn buttonRect(self: *const Overlay, btn: ToolbarButton) ?Rect {
         const sel = self.selection orelse return null;
-        const total_width: u32 = button_size * 2 + button_spacing;
+        const total_width: u32 = button_size * 3 + button_spacing * 2;
         const center_x = sel.x + sel.width / 2;
         const base_x = if (center_x >= total_width / 2) center_x - total_width / 2 else 0;
         const clamped_x = @min(base_x, self.surface_width -| total_width);
@@ -116,6 +118,7 @@ pub const Overlay = struct {
         const bx = switch (btn) {
             .screenshot => clamped_x,
             .record => clamped_x + button_size + button_spacing,
+            .scroll_screenshot => clamped_x + (button_size + button_spacing) * 2,
         };
 
         // Place below selection, above if no room, or centered in selection as last resort
@@ -156,7 +159,7 @@ pub const Overlay = struct {
         if (px < 0 or py < 0) return null;
         const ux: u32 = @intCast(px);
         const uy: u32 = @intCast(py);
-        inline for (.{ ToolbarButton.screenshot, ToolbarButton.record }) |btn| {
+        inline for (.{ ToolbarButton.screenshot, ToolbarButton.record, ToolbarButton.scroll_screenshot }) |btn| {
             if (self.buttonRect(btn)) |br| {
                 if (ux >= br.x and ux < br.x + br.width and
                     uy >= br.y and uy < br.y + br.height)
@@ -830,12 +833,22 @@ pub const Overlay = struct {
         drawFilledCircle(data, stride, @intCast(cx), @intCast(cy), 10, sw, sh, 0xF0, 0x40, 0x40);
     }
 
+    /// Scrolling screenshot icon: downward arrow.
+    fn drawScrollScreenshotIcon(data: []u8, stride: u32, cx: u32, cy: u32, sw: u32, sh: u32) void {
+        // Vertical shaft
+        fillRect(data, stride, cx -| 1, cy -| 10, 3, 16, sw, sh, 0xFF, 0xFF, 0xFF);
+        // Arrowhead: three horizontal lines of increasing width
+        fillRect(data, stride, cx -| 5, cy + 4, 11, 2, sw, sh, 0xFF, 0xFF, 0xFF);
+        fillRect(data, stride, cx -| 3, cy + 6, 7, 2, sw, sh, 0xFF, 0xFF, 0xFF);
+        fillRect(data, stride, cx -| 1, cy + 8, 3, 2, sw, sh, 0xFF, 0xFF, 0xFF);
+    }
+
     fn drawToolbar(self: *Overlay, data: []u8, stride: u32) void {
         if (self.buttonRect(.screenshot) == null) return;
         const sw = self.surface_width;
         const sh = self.surface_height;
 
-        inline for (.{ ToolbarButton.screenshot, ToolbarButton.record }) |btn| {
+        inline for (.{ ToolbarButton.screenshot, ToolbarButton.record, ToolbarButton.scroll_screenshot }) |btn| {
             if (self.buttonRect(btn)) |br| {
                 const is_hovered = self.hovered_button != null and self.hovered_button.? == btn;
 
@@ -857,6 +870,7 @@ pub const Overlay = struct {
                 switch (btn) {
                     .screenshot => drawCameraIcon(data, stride, icon_cx, icon_cy, sw, sh),
                     .record => drawRecordIcon(data, stride, icon_cx, icon_cy, sw, sh),
+                    .scroll_screenshot => drawScrollScreenshotIcon(data, stride, icon_cx, icon_cy, sw, sh),
                 }
             }
         }
@@ -1042,6 +1056,10 @@ fn pointerButton(data: ?*anyopaque, _: ?*wl.c.wl_pointer, _: u32, _: u32, button
                         },
                         .record => {
                             self.action = .record;
+                            self.done = true;
+                        },
+                        .scroll_screenshot => {
+                            self.action = .start_scrolling_capture;
                             self.done = true;
                         },
                     }

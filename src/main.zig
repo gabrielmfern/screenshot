@@ -8,6 +8,7 @@ const CaptureState = @import("capture.zig").CaptureState;
 const Overlay = @import("overlay.zig").Overlay;
 const Recorder = @import("recorder.zig").Recorder;
 const RecordingOverlay = @import("recording_overlay.zig").RecordingOverlay;
+const ScrollingOverlay = @import("scrolling_overlay.zig").ScrollingOverlay;
 const Clipboard = @import("clipboard.zig").Clipboard;
 const Audio = @import("audio.zig").Audio;
 
@@ -440,6 +441,134 @@ pub fn main() !void {
             std.log.info("no selection made", .{});
             return;
         }
+
+        // Scrolling screenshot flow: auto-capture periodically, detect overlap and stitch
+        if (action == .start_scrolling_capture) {
+            // Free the pre-overlay capture; we'll re-capture with the overlay active
+            if (cropped_image) |*img| img.deinit();
+            cropped_image = null;
+
+            var scroll_overlay = ScrollingOverlay{
+                .display = wl_display.?,
+                .compositor = wl_compositor.?,
+                .shm = wl_shm.?,
+                .seat = wl_seat.?,
+                .layer_shell = layer_shell.?,
+                .output = wl_output.?,
+                .region = overlay_selection.?,
+            };
+            try scroll_overlay.init(allocator);
+
+            // Capture the first slice with the overlay active so all captures
+            // are under the same compositing conditions
+            var first_capture = CaptureState{};
+            if (has_ext_capture) {
+                try first_capture.initExtCapture(
+                    wl_display.?,
+                    capture_manager.?,
+                    source_manager.?,
+                    wl_output.?,
+                    wl_shm.?,
+                );
+            } else {
+                try first_capture.initScreencopy(
+                    wl_display.?,
+                    screencopy_manager.?,
+                    wl_output.?,
+                    wl_shm.?,
+                );
+            }
+            var first_full = first_capture.getImage();
+            var stitched_image = try first_full.crop(allocator, capture_selection.?);
+            first_capture.deinit();
+
+            scroll_overlay.setPreviewImage(&stitched_image);
+
+            const capture_interval_ms: u64 = 400;
+            var last_capture_ns: i128 = std.time.nanoTimestamp();
+
+            while (!scroll_overlay.done) {
+                // Non-blocking dispatch for overlay events
+                const action_triggered = scroll_overlay.dispatchNonBlocking() catch {
+                    scroll_overlay.deinit();
+                    stitched_image.deinit();
+                    return error.WaylandDispatchFailed;
+                };
+                if (action_triggered) break;
+
+                // Check if it's time to capture another slice
+                const now = std.time.nanoTimestamp();
+                const elapsed_ms: u64 = @intCast(@max(0, @divFloor(now - last_capture_ns, 1_000_000)));
+                if (elapsed_ms >= capture_interval_ms) {
+                    last_capture_ns = now;
+
+                    // Capture the screen region
+                    var slice_capture = CaptureState{};
+                    const capture_ok = blk: {
+                        if (has_ext_capture) {
+                            slice_capture.initExtCapture(
+                                wl_display.?,
+                                capture_manager.?,
+                                source_manager.?,
+                                wl_output.?,
+                                wl_shm.?,
+                            ) catch break :blk false;
+                        } else {
+                            slice_capture.initScreencopy(
+                                wl_display.?,
+                                screencopy_manager.?,
+                                wl_output.?,
+                                wl_shm.?,
+                            ) catch break :blk false;
+                        }
+                        break :blk true;
+                    };
+                    if (!capture_ok) continue;
+
+                    var full = slice_capture.getImage();
+                    var slice = full.crop(allocator, capture_selection.?) catch {
+                        slice_capture.deinit();
+                        continue;
+                    };
+                    defer slice.deinit();
+                    slice_capture.deinit();
+
+                    // Try smart stitching with overlap detection
+                    if (stitched_image.stitchBelow(allocator, &slice) catch null) |new_img| {
+                        stitched_image.deinit();
+                        stitched_image = new_img;
+                        scroll_overlay.setPreviewImage(&stitched_image);
+                        std.log.info("stitched: {d}x{d}", .{ stitched_image.width, stitched_image.height });
+                    }
+                } else {
+                    std.Thread.sleep(10_000_000);
+                }
+            }
+
+            const scroll_result = scroll_overlay.action;
+            scroll_overlay.deinit();
+            _ = wl.c.wl_display_flush(wl_display);
+
+            if (scroll_result == .confirm) {
+                const timer = Timer.start();
+                const owned_path = if (output_path_arg) |p|
+                    try allocator.dupeZ(u8, p)
+                else
+                    try generateOutputPath(allocator, stitched_image.width, stitched_image.height);
+                defer allocator.free(owned_path);
+                try stitched_image.savePng(owned_path.ptr);
+                Audio.play(.shutter);
+                std.log.info("saved scrolling screenshot to {s} in {d:.1}ms", .{ owned_path, timer.elapsedMs() });
+
+                const tmp_path = "/tmp/screenshot-clipboard.png";
+                try stitched_image.savePng(tmp_path);
+                copyFileToClipboard(allocator, tmp_path, "image/png") catch {};
+                std.fs.deleteFileAbsolute(tmp_path) catch {};
+            }
+            stitched_image.deinit();
+            capture.deinit();
+            return;
+        }
     }
 
     // Step 3: Execute the chosen action
@@ -447,6 +576,7 @@ pub fn main() !void {
     var clipboard_forked = false;
 
     switch (action) {
+        .start_scrolling_capture => unreachable, // handled above with early return
         .copy_to_clipboard => {
             const timer = Timer.start();
             const tmp_path = "/tmp/screenshot-clipboard.png";
@@ -661,6 +791,7 @@ comptime {
     _ = @import("image.zig");
     _ = @import("recorder.zig");
     _ = @import("recording_overlay.zig");
+    _ = @import("scrolling_overlay.zig");
     _ = @import("clipboard.zig");
     _ = @import("audio.zig");
 }

@@ -70,6 +70,146 @@ pub const Image = struct {
         };
     }
 
+    /// Append another image below this one (same width). Returns a new allocated image.
+    pub fn appendBelow(self: *const Image, allocator: std.mem.Allocator, other: *const Image) !Image {
+        if (self.width != other.width) return error.MismatchedWidth;
+        const new_height = self.height + other.height;
+        const new_stride = self.width * bpp;
+        const new_data = try allocator.alloc(u8, new_height * new_stride);
+        errdefer allocator.free(new_data);
+
+        for (0..self.height) |row| {
+            const src_offset = @as(usize, row) * self.stride;
+            const dst_offset = @as(usize, row) * new_stride;
+            const row_bytes = self.width * bpp;
+            @memcpy(new_data[dst_offset..][0..row_bytes], self.data[src_offset..][0..row_bytes]);
+        }
+        for (0..other.height) |row| {
+            const src_offset = @as(usize, row) * other.stride;
+            const dst_offset = @as(usize, self.height + row) * new_stride;
+            const row_bytes = other.width * bpp;
+            @memcpy(new_data[dst_offset..][0..row_bytes], other.data[src_offset..][0..row_bytes]);
+        }
+
+        return .{
+            .data = new_data,
+            .width = self.width,
+            .height = new_height,
+            .stride = new_stride,
+            .allocator = allocator,
+        };
+    }
+
+    /// Stitch another image below this one, detecting and removing the overlapping
+    /// region. If no overlap is found (or images are identical), returns null.
+    pub fn stitchBelow(self: *const Image, allocator: std.mem.Allocator, other: *const Image) !?Image {
+        if (self.width != other.width) return error.MismatchedWidth;
+        const overlap = findVerticalOverlap(self, other);
+        if (overlap == 0) return null;
+        if (overlap >= other.height) return null; // identical or fully contained
+
+        const new_rows = other.height - overlap;
+        const new_height = self.height + new_rows;
+        const new_stride = self.width * bpp;
+        const new_data = try allocator.alloc(u8, new_height * new_stride);
+        errdefer allocator.free(new_data);
+
+        // Copy all of self
+        for (0..self.height) |row| {
+            const src_off = @as(usize, row) * self.stride;
+            const dst_off = @as(usize, row) * new_stride;
+            const row_bytes = self.width * bpp;
+            @memcpy(new_data[dst_off..][0..row_bytes], self.data[src_off..][0..row_bytes]);
+        }
+        // Copy only the non-overlapping part of other
+        for (overlap..other.height) |row| {
+            const src_off = @as(usize, row) * other.stride;
+            const dst_off = @as(usize, self.height + row - overlap) * new_stride;
+            const row_bytes = other.width * bpp;
+            @memcpy(new_data[dst_off..][0..row_bytes], other.data[src_off..][0..row_bytes]);
+        }
+
+        return .{
+            .data = new_data,
+            .width = self.width,
+            .height = new_height,
+            .stride = new_stride,
+            .allocator = allocator,
+        };
+    }
+
+    /// Find how many rows from the bottom of `top` match the top of `bottom`.
+    /// Compares rows using a sampled subset of pixels for speed.
+    fn findVerticalOverlap(top: *const Image, bottom: *const Image) u32 {
+        if (top.width != bottom.width) return 0;
+        const w = top.width;
+        const h_top = top.height;
+        const h_bot = bottom.height;
+        if (h_top == 0 or h_bot == 0 or w == 0) return 0;
+
+        const max_check = @min(h_top, h_bot);
+        // Minimum overlap to consider (avoids single-row false positives)
+        const min_overlap: u32 = 4;
+        if (max_check < min_overlap) return 0;
+
+        // Sample pixel columns for fast row comparison (every ~8px, plus edges)
+        const sample_step: u32 = @max(1, w / 32);
+
+        // Try overlap sizes from large to small, return first good match
+        var overlap: u32 = max_check;
+        while (overlap >= min_overlap) : (overlap -= 1) {
+            if (checkOverlap(top, bottom, overlap, w, h_top, sample_step))
+                return overlap;
+        }
+        return 0;
+    }
+
+    fn checkOverlap(top: *const Image, bottom: *const Image, overlap: u32, w: u32, h_top: u32, sample_step: u32) bool {
+        const start_row_top = h_top - overlap;
+        // Check a few rows spread across the overlap region
+        const rows_to_check = @min(overlap, 8);
+        const row_step = @max(1, overlap / rows_to_check);
+        var ri: u32 = 0;
+        while (ri < overlap) : (ri += row_step) {
+            const top_row = start_row_top + ri;
+            const bot_row = ri;
+            if (!rowsMatch(top, bottom, top_row, bot_row, w, sample_step))
+                return false;
+        }
+        // Always check the last row too
+        if (!rowsMatch(top, bottom, h_top - 1, overlap - 1, w, sample_step))
+            return false;
+        return true;
+    }
+
+    fn rowsMatch(top: *const Image, bottom: *const Image, top_row: u32, bot_row: u32, w: u32, sample_step: u32) bool {
+        // Skip edge pixels to avoid compositor blending artifacts at selection boundaries
+        const edge_skip: u32 = @min(8, w / 4);
+        var x: u32 = edge_skip;
+        while (x < w -| edge_skip) : (x += sample_step) {
+            const t_off = @as(usize, top_row) * top.stride + @as(usize, x) * bpp;
+            const b_off = @as(usize, bot_row) * bottom.stride + @as(usize, x) * bpp;
+            if (t_off + 2 >= top.data.len or b_off + 2 >= bottom.data.len) return false;
+            // Compare RGB with small tolerance (ignore alpha)
+            const tolerance: u8 = 2;
+            const d0 = if (top.data[t_off] > bottom.data[b_off])
+                top.data[t_off] - bottom.data[b_off]
+            else
+                bottom.data[b_off] - top.data[t_off];
+            const d1 = if (top.data[t_off + 1] > bottom.data[b_off + 1])
+                top.data[t_off + 1] - bottom.data[b_off + 1]
+            else
+                bottom.data[b_off + 1] - top.data[t_off + 1];
+            const d2 = if (top.data[t_off + 2] > bottom.data[b_off + 2])
+                top.data[t_off + 2] - bottom.data[b_off + 2]
+            else
+                bottom.data[b_off + 2] - top.data[t_off + 2];
+            if (d0 > tolerance or d1 > tolerance or d2 > tolerance)
+                return false;
+        }
+        return true;
+    }
+
     /// Create a new image by copying a rectangular region from this image.
     pub fn crop(self: *const Image, allocator: std.mem.Allocator, region: Rect) !Image {
         const r = region.clampToBounds(self.width, self.height);
