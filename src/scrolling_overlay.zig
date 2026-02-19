@@ -71,8 +71,26 @@ pub const ScrollingOverlay = struct {
     fn previewRect(self: *const ScrollingOverlay) Rect {
         const w = self.surface_width;
         const h = self.surface_height;
-        const pw = @min(preview_max_width, w -| margin * 2);
-        const ph = @min(preview_max_height, h -| margin * 2);
+        const max_pw = @min(preview_max_width, w -| margin * 2);
+        const max_ph = @min(preview_max_height, h -| margin * 2);
+
+        var pw: u32 = max_pw;
+        var ph: u32 = max_ph;
+
+        if (self.preview_image) |img| {
+            if (img.width > 0 and img.height > 0 and max_pw > 0 and max_ph > 0) {
+                const img_aspect: f64 = @as(f64, @floatFromInt(img.width)) / @as(f64, @floatFromInt(img.height));
+                const max_aspect: f64 = @as(f64, @floatFromInt(max_pw)) / @as(f64, @floatFromInt(max_ph));
+                if (img_aspect >= max_aspect) {
+                    pw = max_pw;
+                    ph = @max(1, @as(u32, @intFromFloat(@as(f64, @floatFromInt(max_pw)) / img_aspect)));
+                } else {
+                    ph = max_ph;
+                    pw = @max(1, @as(u32, @intFromFloat(@as(f64, @floatFromInt(max_ph)) * img_aspect)));
+                }
+            }
+        }
+
         return .{
             .x = w -| margin -| pw,
             .y = margin,
@@ -366,29 +384,13 @@ pub const ScrollingOverlay = struct {
         const box_h = prev.height -| inner_margin * 2;
         if (box_w == 0 or box_h == 0) return;
 
-        const src_aspect: f64 = @as(f64, @floatFromInt(img.width)) / @as(f64, @floatFromInt(img.height));
-        const box_aspect: f64 = @as(f64, @floatFromInt(box_w)) / @as(f64, @floatFromInt(box_h));
-
-        var crop_x: u32 = 0;
-        var crop_y: u32 = 0;
-        var crop_w: u32 = img.width;
-        var crop_h: u32 = img.height;
-
-        if (src_aspect > box_aspect) {
-            crop_w = @intFromFloat(@max(1.0, @as(f64, @floatFromInt(img.height)) * box_aspect));
-            crop_x = (img.width -| crop_w) / 2;
-        } else if (src_aspect < box_aspect) {
-            crop_h = @intFromFloat(@max(1.0, @as(f64, @floatFromInt(img.width)) / box_aspect));
-            crop_y = img.height -| crop_h;
-        }
-
         const start_x = prev.x + inner_margin;
         const start_y = prev.y + inner_margin;
 
         for (0..box_h) |dy| {
             for (0..box_w) |dx| {
-                const src_x = crop_x + @min((@as(u64, dx) * crop_w) / box_w, crop_w -| 1);
-                const src_y = crop_y + @min((@as(u64, dy) * crop_h) / box_h, crop_h -| 1);
+                const src_x = @min((@as(u64, dx) * img.width) / box_w, img.width -| 1);
+                const src_y = @min((@as(u64, dy) * img.height) / box_h, img.height -| 1);
                 const src_offset = @as(usize, src_y) * img.stride + @as(usize, src_x) * Image.bpp;
                 const dst_offset = @as(usize, start_y + dy) * stride + @as(usize, start_x + dx) * bpp;
                 if (src_offset + 3 < img.data.len and dst_offset + 3 < data.len) {
