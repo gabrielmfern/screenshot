@@ -169,29 +169,39 @@ pub const Image = struct {
         // Check a few rows spread across the overlap region
         const rows_to_check = @min(overlap, 8);
         const row_step = @max(1, overlap / rows_to_check);
+        var rows_checked: u32 = 0;
+        var rows_matched: u32 = 0;
         var ri: u32 = 0;
         while (ri < overlap) : (ri += row_step) {
             const top_row = start_row_top + ri;
             const bot_row = ri;
-            if (!rowsMatch(top, bottom, top_row, bot_row, w, sample_step))
-                return false;
+            rows_checked += 1;
+            if (rowsMatch(top, bottom, top_row, bot_row, w, sample_step)) {
+                rows_matched += 1;
+            }
         }
         // Always check the last row too
-        if (!rowsMatch(top, bottom, h_top - 1, overlap - 1, w, sample_step))
-            return false;
-        return true;
+        rows_checked += 1;
+        if (rowsMatch(top, bottom, h_top - 1, overlap - 1, w, sample_step)) {
+            rows_matched += 1;
+        }
+
+        // Allow a small fraction of mismatched rows for dynamic content/animation noise.
+        return rows_matched * 100 >= rows_checked * 85;
     }
 
     fn rowsMatch(top: *const Image, bottom: *const Image, top_row: u32, bot_row: u32, w: u32, sample_step: u32) bool {
         // Skip edge pixels to avoid compositor blending artifacts at selection boundaries
         const edge_skip: u32 = @min(8, w / 4);
+        var samples: u32 = 0;
+        var matched: u32 = 0;
         var x: u32 = edge_skip;
         while (x < w -| edge_skip) : (x += sample_step) {
             const t_off = @as(usize, top_row) * top.stride + @as(usize, x) * bpp;
             const b_off = @as(usize, bot_row) * bottom.stride + @as(usize, x) * bpp;
             if (t_off + 2 >= top.data.len or b_off + 2 >= bottom.data.len) return false;
             // Compare RGB with small tolerance (ignore alpha)
-            const tolerance: u8 = 2;
+            const tolerance: u8 = 6;
             const d0 = if (top.data[t_off] > bottom.data[b_off])
                 top.data[t_off] - bottom.data[b_off]
             else
@@ -204,10 +214,13 @@ pub const Image = struct {
                 top.data[t_off + 2] - bottom.data[b_off + 2]
             else
                 bottom.data[b_off + 2] - top.data[t_off + 2];
-            if (d0 > tolerance or d1 > tolerance or d2 > tolerance)
-                return false;
+            samples += 1;
+            if (d0 <= tolerance and d1 <= tolerance and d2 <= tolerance) {
+                matched += 1;
+            }
         }
-        return true;
+        if (samples == 0) return true;
+        return matched * 100 >= samples * 80;
     }
 
     /// Create a new image by copying a rectangular region from this image.
