@@ -366,20 +366,29 @@ pub const ScrollingOverlay = struct {
         const box_h = prev.height -| inner_margin * 2;
         if (box_w == 0 or box_h == 0) return;
 
-        const scale_x: f64 = @as(f64, @floatFromInt(box_w)) / @as(f64, @floatFromInt(img.width));
-        const scale_y: f64 = @as(f64, @floatFromInt(box_h)) / @as(f64, @floatFromInt(img.height));
-        const scale = @min(scale_x, scale_y);
-        const dst_w: u32 = @intFromFloat(@min(@as(f64, @floatFromInt(img.width)) * scale, @as(f64, @floatFromInt(box_w))));
-        const dst_h: u32 = @intFromFloat(@min(@as(f64, @floatFromInt(img.height)) * scale, @as(f64, @floatFromInt(box_h))));
-        if (dst_w == 0 or dst_h == 0) return;
+        const src_aspect: f64 = @as(f64, @floatFromInt(img.width)) / @as(f64, @floatFromInt(img.height));
+        const box_aspect: f64 = @as(f64, @floatFromInt(box_w)) / @as(f64, @floatFromInt(box_h));
 
-        const start_x = prev.x + inner_margin + (box_w -| dst_w) / 2;
-        const start_y = prev.y + inner_margin + (box_h -| dst_h) / 2;
+        var crop_x: u32 = 0;
+        var crop_y: u32 = 0;
+        var crop_w: u32 = img.width;
+        var crop_h: u32 = img.height;
 
-        for (0..dst_h) |dy| {
-            for (0..dst_w) |dx| {
-                const src_x = @min((@as(u64, dx) * img.width) / dst_w, img.width -| 1);
-                const src_y = @min((@as(u64, dy) * img.height) / dst_h, img.height -| 1);
+        if (src_aspect > box_aspect) {
+            crop_w = @intFromFloat(@max(1.0, @as(f64, @floatFromInt(img.height)) * box_aspect));
+            crop_x = (img.width -| crop_w) / 2;
+        } else if (src_aspect < box_aspect) {
+            crop_h = @intFromFloat(@max(1.0, @as(f64, @floatFromInt(img.width)) / box_aspect));
+            crop_y = img.height -| crop_h;
+        }
+
+        const start_x = prev.x + inner_margin;
+        const start_y = prev.y + inner_margin;
+
+        for (0..box_h) |dy| {
+            for (0..box_w) |dx| {
+                const src_x = crop_x + @min((@as(u64, dx) * crop_w) / box_w, crop_w -| 1);
+                const src_y = crop_y + @min((@as(u64, dy) * crop_h) / box_h, crop_h -| 1);
                 const src_offset = @as(usize, src_y) * img.stride + @as(usize, src_x) * Image.bpp;
                 const dst_offset = @as(usize, start_y + dy) * stride + @as(usize, start_x + dx) * bpp;
                 if (src_offset + 3 < img.data.len and dst_offset + 3 < data.len) {
@@ -752,4 +761,3 @@ const scroll_pointer_listener: wl.c.wl_pointer_listener = .{
     .frame = scrollPointerFrame,
     .axis_source = scrollPointerAxisSource,
 };
-
