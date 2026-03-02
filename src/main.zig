@@ -484,7 +484,7 @@ pub fn main() !void {
 
             scroll_overlay.setPreviewImage(&stitched_image);
 
-            const capture_interval_ms: u64 = 400;
+            const capture_interval_ms: u64 = 16;
             var last_capture_ns: i128 = std.time.nanoTimestamp();
 
             while (!scroll_overlay.done) {
