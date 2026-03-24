@@ -45,6 +45,13 @@ pub const CaptureState = struct {
     ) !void {
         self.backend = .wlr_screencopy;
         self.display = display;
+        self.buffer_width = 0;
+        self.buffer_height = 0;
+        self.buffer_stride = 0;
+        self.shm_format = 0;
+        self.buffer_info_done = false;
+        self.frame_ready = false;
+        self.frame_failed = false;
 
         // capture_output: overlay_cursor=0 to exclude cursor from screenshot
         self.screencopy_frame = wl.c.zwlr_screencopy_manager_v1_capture_output(
@@ -52,6 +59,12 @@ pub const CaptureState = struct {
             0, // overlay_cursor: 0 = no cursor, 1 = include cursor
             output,
         ) orelse return error.FailedToCreateFrame;
+        defer {
+            if (self.screencopy_frame) |f| {
+                wl.c.zwlr_screencopy_frame_v1_destroy(f);
+                self.screencopy_frame = null;
+            }
+        }
 
         _ = wl.c.zwlr_screencopy_frame_v1_add_listener(
             self.screencopy_frame.?,
@@ -96,6 +109,13 @@ pub const CaptureState = struct {
     ) !void {
         self.backend = .ext_image_copy_capture;
         self.display = display;
+        self.buffer_width = 0;
+        self.buffer_height = 0;
+        self.buffer_stride = 0;
+        self.shm_format = 0;
+        self.buffer_info_done = false;
+        self.frame_ready = false;
+        self.frame_failed = false;
 
         const source = wl.c.ext_output_image_capture_source_manager_v1_create_source(
             source_manager,
@@ -107,6 +127,16 @@ pub const CaptureState = struct {
             @ptrCast(source),
             0, // no options: don't paint cursors
         ) orelse return error.FailedToCreateCaptureSession;
+        defer {
+            if (self.ext_frame) |f| {
+                wl.c.ext_image_copy_capture_frame_v1_destroy(f);
+                self.ext_frame = null;
+            }
+            if (self.ext_session) |s| {
+                wl.c.ext_image_copy_capture_session_v1_destroy(s);
+                self.ext_session = null;
+            }
+        }
 
         _ = wl.c.ext_image_copy_capture_session_v1_add_listener(
             self.ext_session.?,
@@ -117,10 +147,11 @@ pub const CaptureState = struct {
         wl.c.ext_image_capture_source_v1_destroy(source);
 
         // Wait for buffer constraints
-        while (!self.buffer_info_done) {
+        while (!self.buffer_info_done and !self.frame_failed) {
             if (wl.c.wl_display_roundtrip(display) == -1)
                 return error.WaylandRoundtripFailed;
         }
+        if (self.frame_failed) return error.CaptureFailed;
 
         if (self.buffer_width == 0 or self.buffer_height == 0)
             return error.InvalidBufferConstraints;
