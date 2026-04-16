@@ -30,10 +30,23 @@ pub const Overlay = struct {
     // The screenshot image to display as background
     screenshot: *const Image = undefined,
 
-    // Surface dimensions (assigned by compositor via configure)
+    // Surface dimensions in logical pixels (assigned by compositor via configure).
+    // Pointer events and the stored selection are also in this space.
     surface_width: u32 = 0,
     surface_height: u32 = 0,
     configured: bool = false,
+
+    // Buffer is sized to match the compositor's preferred fractional scale
+    // (wp_fractional_scale_v1) and mapped back to logical size via wp_viewporter.
+    // `scale_120` is in 1/120ths of a unit: 120 = 1.0x, 150 = 1.25x, 240 = 2.0x.
+    // `render_*` are the buffer's pixel dimensions, frozen at init time.
+    viewporter: ?*wl.c.wp_viewporter = null,
+    fractional_scale_mgr: ?*wl.c.wp_fractional_scale_manager_v1 = null,
+    viewport: ?*wl.c.wp_viewport = null,
+    fractional_scale: ?*wl.c.wp_fractional_scale_v1 = null,
+    scale_120: u32 = 120,
+    render_width: u32 = 0,
+    render_height: u32 = 0,
 
     // SHM buffers (double-buffered)
     buffers: [2]?ShmBuffer = .{ null, null },
@@ -271,6 +284,20 @@ pub const Overlay = struct {
             self,
         );
 
+        // Set up viewporter + fractional-scale BEFORE the first commit so the
+        // compositor can start delivering preferred_scale events right away.
+        // Per the fractional-scale protocol, wl_surface.buffer_scale must stay
+        // at 1 when using the viewporter-based path.
+        if (self.fractional_scale_mgr) |mgr| {
+            self.fractional_scale = wl.c.wp_fractional_scale_manager_v1_get_fractional_scale(mgr, self.surface.?);
+            if (self.fractional_scale) |fs| {
+                _ = wl.c.wp_fractional_scale_v1_add_listener(fs, &fractional_scale_listener, self);
+            }
+        }
+        if (self.viewporter) |vp| {
+            self.viewport = wl.c.wp_viewporter_get_viewport(vp, self.surface.?);
+        }
+
         wl.c.wl_surface_commit(self.surface.?);
 
         self.pointer = wl.c.wl_seat_get_pointer(self.seat);
@@ -286,6 +313,35 @@ pub const Overlay = struct {
             if (wl.c.wl_display_roundtrip(self.display) == -1)
                 return error.WaylandRoundtripFailed;
         }
+
+        // preferred_scale has no ordering guarantee vs. configure, so flush
+        // one more roundtrip to collect any straggler events. If nothing
+        // arrives (compositor doesn't support it or hasn't decided yet),
+        // scale_120 stays at its default of 120 (1.0x).
+        if (self.fractional_scale != null) {
+            if (wl.c.wl_display_roundtrip(self.display) == -1)
+                return error.WaylandRoundtripFailed;
+        }
+
+        // Without a viewport we can't safely describe a non-1x buffer, so
+        // fall back to 1:1 rendering regardless of any reported scale.
+        if (self.viewport == null) self.scale_120 = 120;
+        // Sanity-clamp against nonsense values.
+        self.scale_120 = @min(@max(self.scale_120, 60), 600);
+
+        self.render_width = @intCast((@as(u64, self.surface_width) * self.scale_120) / 120);
+        self.render_height = @intCast((@as(u64, self.surface_height) * self.scale_120) / 120);
+
+        if (self.viewport) |vp| {
+            wl.c.wp_viewport_set_destination(vp, @intCast(self.surface_width), @intCast(self.surface_height));
+            wl.c.wl_surface_set_buffer_scale(self.surface.?, 1);
+        }
+
+        std.log.info("overlay: surface {d}x{d} logical, buffer {d}x{d} (scale {d}/120)", .{
+            self.surface_width, self.surface_height,
+            self.render_width,  self.render_height,
+            self.scale_120,
+        });
 
         try self.createBuffers();
         try self.preRenderDarkBackground();
@@ -309,8 +365,8 @@ pub const Overlay = struct {
             if (buf.*) |*b| b.destroy();
             buf.* = try ShmBuffer.create(
                 self.shm,
-                self.surface_width,
-                self.surface_height,
+                self.render_width,
+                self.render_height,
                 wl.c.WL_SHM_FORMAT_ARGB8888,
             );
         }
@@ -319,23 +375,23 @@ pub const Overlay = struct {
     /// Pre-render the darkened screenshot into a CPU-side buffer.
     /// This is done once and then memcpy'd into the back buffer each frame.
     fn preRenderDarkBackground(self: *Overlay) !void {
-        const stride = self.surface_width * ShmBuffer.bpp;
-        const size: usize = @as(usize, self.surface_height) * stride;
+        const stride = self.render_width * ShmBuffer.bpp;
+        const size: usize = @as(usize, self.render_height) * stride;
         self.dark_bg = try self.allocator.alloc(u8, size);
         const bg = self.dark_bg.?;
         const bpp = ShmBuffer.bpp;
 
         const same_dimensions =
-            self.surface_width == self.screenshot.width and
-            self.surface_height == self.screenshot.height;
+            self.render_width == self.screenshot.width and
+            self.render_height == self.screenshot.height;
 
-        for (0..self.surface_height) |yy| {
+        for (0..self.render_height) |yy| {
             const y: u32 = @intCast(yy);
-            const src_y = if (same_dimensions) y else self.mapSurfaceToScreenshotY(y);
+            const src_y = if (same_dimensions) y else self.mapRenderToScreenshotY(y);
 
-            for (0..self.surface_width) |xx| {
+            for (0..self.render_width) |xx| {
                 const x: u32 = @intCast(xx);
-                const src_x = if (same_dimensions) x else self.mapSurfaceToScreenshotX(x);
+                const src_x = if (same_dimensions) x else self.mapRenderToScreenshotX(x);
 
                 const dst_offset = @as(usize, y) * stride + @as(usize, x) * bpp;
                 const src_offset = @as(usize, src_y) * self.screenshot.stride + @as(usize, src_x) * Image.bpp;
@@ -350,18 +406,36 @@ pub const Overlay = struct {
         }
     }
 
-    fn mapSurfaceToScreenshotX(self: *const Overlay, x: u32) u32 {
-        return mapCoordFloor(x, self.surface_width, self.screenshot.width);
+    fn mapRenderToScreenshotX(self: *const Overlay, x: u32) u32 {
+        return mapCoordFloor(x, self.render_width, self.screenshot.width);
     }
 
-    fn mapSurfaceToScreenshotY(self: *const Overlay, y: u32) u32 {
-        return mapCoordFloor(y, self.surface_height, self.screenshot.height);
+    fn mapRenderToScreenshotY(self: *const Overlay, y: u32) u32 {
+        return mapCoordFloor(y, self.render_height, self.screenshot.height);
     }
 
     fn mapCoordFloor(coord: u32, src_extent: u32, dst_extent: u32) u32 {
         if (src_extent == 0 or dst_extent == 0) return 0;
         const mapped: u64 = (@as(u64, coord) * dst_extent) / src_extent;
         return @intCast(@min(mapped, @as(u64, dst_extent - 1)));
+    }
+
+    /// Scale a logical (surface-space) scalar to render (buffer-space) pixels.
+    /// Uses the frozen render/surface ratio so late preferred_scale updates
+    /// cannot introduce drift between coords and the buffer.
+    fn sc(self: *const Overlay, v: u32) u32 {
+        if (self.surface_width == 0) return v;
+        return @intCast((@as(u64, v) * self.render_width) / self.surface_width);
+    }
+
+    /// Scale a surface-space rect into render-space.
+    fn toRenderRect(self: *const Overlay, r: Rect) Rect {
+        return .{
+            .x = self.sc(r.x),
+            .y = self.sc(r.y),
+            .width = self.sc(r.width),
+            .height = self.sc(r.height),
+        };
     }
 
     fn setCursor(self: *Overlay, serial: u32) void {
@@ -440,24 +514,25 @@ pub const Overlay = struct {
 
         if (sel.isEmpty()) return;
 
-        // Clamp selection to surface bounds
+        // Clamp selection to logical surface bounds, then scale to render space
         const clamped = sel.clampToBounds(self.surface_width, self.surface_height);
         if (clamped.isEmpty()) return;
+        const render_clamped = self.toRenderRect(clamped);
 
         const bpp = ShmBuffer.bpp;
 
         const same_dimensions =
-            self.surface_width == self.screenshot.width and
-            self.surface_height == self.screenshot.height;
+            self.render_width == self.screenshot.width and
+            self.render_height == self.screenshot.height;
 
         // Restore original brightness only inside the selection rectangle
-        for (clamped.y..clamped.y + clamped.height) |yy| {
+        for (render_clamped.y..render_clamped.y + render_clamped.height) |yy| {
             const y: u32 = @intCast(yy);
 
             if (same_dimensions) {
-                const dst_row_start = @as(usize, y) * stride + @as(usize, clamped.x) * bpp;
-                const src_row_start = @as(usize, y) * self.screenshot.stride + @as(usize, clamped.x) * Image.bpp;
-                const row_bytes = @as(usize, clamped.width) * bpp;
+                const dst_row_start = @as(usize, y) * stride + @as(usize, render_clamped.x) * bpp;
+                const src_row_start = @as(usize, y) * self.screenshot.stride + @as(usize, render_clamped.x) * Image.bpp;
+                const row_bytes = @as(usize, render_clamped.width) * bpp;
 
                 if (src_row_start + row_bytes <= self.screenshot.data.len and
                     dst_row_start + row_bytes <= data.len)
@@ -474,10 +549,10 @@ pub const Overlay = struct {
                     }
                 }
             } else {
-                const src_y = self.mapSurfaceToScreenshotY(y);
-                for (clamped.x..clamped.x + clamped.width) |xx| {
+                const src_y = self.mapRenderToScreenshotY(y);
+                for (render_clamped.x..render_clamped.x + render_clamped.width) |xx| {
                     const x: u32 = @intCast(xx);
-                    const src_x = self.mapSurfaceToScreenshotX(x);
+                    const src_x = self.mapRenderToScreenshotX(x);
 
                     const dst_offset = @as(usize, y) * stride + @as(usize, x) * bpp;
                     const src_offset = @as(usize, src_y) * self.screenshot.stride + @as(usize, src_x) * Image.bpp;
@@ -509,8 +584,8 @@ pub const Overlay = struct {
             self.surface.?,
             0,
             0,
-            @intCast(self.surface_width),
-            @intCast(self.surface_height),
+            @intCast(self.render_width),
+            @intCast(self.render_height),
         );
         wl.c.wl_surface_commit(self.surface.?);
         self.current_buf +%= 1;
@@ -550,76 +625,78 @@ pub const Overlay = struct {
     }
 
     fn drawSelectionBorder(self: *Overlay, data: []u8, stride: u32, sel: Rect) void {
-        const border: u32 = 1;
-        const sw = self.surface_width;
-        const sh = self.surface_height;
+        const rsel = self.toRenderRect(sel);
+        const border: u32 = @max(self.sc(1), 1);
+        const sw = self.render_width;
+        const sh = self.render_height;
 
-        const max_x = @min(sel.x + sel.width, sw);
-        const max_y = @min(sel.y + sel.height, sh);
+        const max_x = @min(rsel.x + rsel.width, sw);
+        const max_y = @min(rsel.y + rsel.height, sh);
 
         // Top edge
-        fillRect(data, stride, sel.x, sel.y, sel.width, border, sw, sh, 0xFF, 0xFF, 0xFF);
+        fillRect(data, stride, rsel.x, rsel.y, rsel.width, border, sw, sh, 0xFF, 0xFF, 0xFF);
         // Bottom edge
         if (max_y > 0) {
-            fillRect(data, stride, sel.x, max_y -| border, sel.width, border, sw, sh, 0xFF, 0xFF, 0xFF);
+            fillRect(data, stride, rsel.x, max_y -| border, rsel.width, border, sw, sh, 0xFF, 0xFF, 0xFF);
         }
         // Left edge
-        fillRect(data, stride, sel.x, sel.y, border, sel.height, sw, sh, 0xFF, 0xFF, 0xFF);
+        fillRect(data, stride, rsel.x, rsel.y, border, rsel.height, sw, sh, 0xFF, 0xFF, 0xFF);
         // Right edge
         if (max_x > 0) {
-            fillRect(data, stride, max_x -| border, sel.y, border, sel.height, sw, sh, 0xFF, 0xFF, 0xFF);
+            fillRect(data, stride, max_x -| border, rsel.y, border, rsel.height, sw, sh, 0xFF, 0xFF, 0xFF);
         }
     }
 
     fn drawHandles(self: *Overlay, data: []u8, stride: u32, sel: Rect) void {
-        const sw = self.surface_width;
-        const sh = self.surface_height;
+        const rsel = self.toRenderRect(sel);
+        const sw = self.render_width;
+        const sh = self.render_height;
 
-        // Handle dimensions
-        const handle_len: u32 = 16; // length of the L-shaped corner arm
-        const handle_thick: u32 = 3; // thickness
-        const edge_handle_len: u32 = 12; // length of midpoint edge handles
-        const edge_handle_thick: u32 = 3;
+        // Handle dimensions (in render pixels)
+        const handle_len: u32 = self.sc(16);
+        const handle_thick: u32 = @max(self.sc(3), 1);
+        const edge_handle_len: u32 = self.sc(12);
+        const edge_handle_thick: u32 = @max(self.sc(3), 1);
 
-        const max_x = @min(sel.x + sel.width, sw);
-        const max_y = @min(sel.y + sel.height, sh);
+        const max_x = @min(rsel.x + rsel.width, sw);
+        const max_y = @min(rsel.y + rsel.height, sh);
 
-        if (sel.width < 4 or sel.height < 4) return;
+        if (rsel.width < self.sc(4) or rsel.height < self.sc(4)) return;
 
         // ── Corner handles (L-shaped) ───────────────────────────────
-        const hl = @min(handle_len, sel.width / 2);
-        const vl = @min(handle_len, sel.height / 2);
+        const hl = @min(handle_len, rsel.width / 2);
+        const vl = @min(handle_len, rsel.height / 2);
 
         // Top-left corner
-        fillRect(data, stride, sel.x, sel.y, hl, handle_thick, sw, sh, 0xFF, 0xFF, 0xFF);
-        fillRect(data, stride, sel.x, sel.y, handle_thick, vl, sw, sh, 0xFF, 0xFF, 0xFF);
+        fillRect(data, stride, rsel.x, rsel.y, hl, handle_thick, sw, sh, 0xFF, 0xFF, 0xFF);
+        fillRect(data, stride, rsel.x, rsel.y, handle_thick, vl, sw, sh, 0xFF, 0xFF, 0xFF);
 
         // Top-right corner
-        fillRect(data, stride, max_x -| hl, sel.y, hl, handle_thick, sw, sh, 0xFF, 0xFF, 0xFF);
-        fillRect(data, stride, max_x -| handle_thick, sel.y, handle_thick, vl, sw, sh, 0xFF, 0xFF, 0xFF);
+        fillRect(data, stride, max_x -| hl, rsel.y, hl, handle_thick, sw, sh, 0xFF, 0xFF, 0xFF);
+        fillRect(data, stride, max_x -| handle_thick, rsel.y, handle_thick, vl, sw, sh, 0xFF, 0xFF, 0xFF);
 
         // Bottom-left corner
-        fillRect(data, stride, sel.x, max_y -| handle_thick, hl, handle_thick, sw, sh, 0xFF, 0xFF, 0xFF);
-        fillRect(data, stride, sel.x, max_y -| vl, handle_thick, vl, sw, sh, 0xFF, 0xFF, 0xFF);
+        fillRect(data, stride, rsel.x, max_y -| handle_thick, hl, handle_thick, sw, sh, 0xFF, 0xFF, 0xFF);
+        fillRect(data, stride, rsel.x, max_y -| vl, handle_thick, vl, sw, sh, 0xFF, 0xFF, 0xFF);
 
         // Bottom-right corner
         fillRect(data, stride, max_x -| hl, max_y -| handle_thick, hl, handle_thick, sw, sh, 0xFF, 0xFF, 0xFF);
         fillRect(data, stride, max_x -| handle_thick, max_y -| vl, handle_thick, vl, sw, sh, 0xFF, 0xFF, 0xFF);
 
         // ── Edge midpoint handles (short bars) ──────────────────────
-        const mid_x = sel.x + sel.width / 2;
-        const mid_y = sel.y + sel.height / 2;
-        const ehl = @min(edge_handle_len, sel.width / 2);
-        const evl = @min(edge_handle_len, sel.height / 2);
+        const mid_x = rsel.x + rsel.width / 2;
+        const mid_y = rsel.y + rsel.height / 2;
+        const ehl = @min(edge_handle_len, rsel.width / 2);
+        const evl = @min(edge_handle_len, rsel.height / 2);
 
         // Top edge center
-        fillRect(data, stride, mid_x -| (ehl / 2), sel.y, ehl, edge_handle_thick, sw, sh, 0xFF, 0xFF, 0xFF);
+        fillRect(data, stride, mid_x -| (ehl / 2), rsel.y, ehl, edge_handle_thick, sw, sh, 0xFF, 0xFF, 0xFF);
 
         // Bottom edge center
         fillRect(data, stride, mid_x -| (ehl / 2), max_y -| edge_handle_thick, ehl, edge_handle_thick, sw, sh, 0xFF, 0xFF, 0xFF);
 
         // Left edge center
-        fillRect(data, stride, sel.x, mid_y -| (evl / 2), edge_handle_thick, evl, sw, sh, 0xFF, 0xFF, 0xFF);
+        fillRect(data, stride, rsel.x, mid_y -| (evl / 2), edge_handle_thick, evl, sw, sh, 0xFF, 0xFF, 0xFF);
 
         // Right edge center
         fillRect(data, stride, max_x -| edge_handle_thick, mid_y -| (evl / 2), edge_handle_thick, evl, sw, sh, 0xFF, 0xFF, 0xFF);
@@ -806,16 +883,19 @@ pub const Overlay = struct {
     }
 
     /// Camera icon: body outline + viewfinder bump + lens circle + inner dot.
-    fn drawCameraIcon(data: []u8, stride: u32, cx: u32, cy: u32, sw: u32, sh: u32) void {
+    /// cx/cy are in render-space pixels.
+    fn drawCameraIcon(self: *const Overlay, data: []u8, stride: u32, cx: u32, cy: u32) void {
+        const sw = self.render_width;
+        const sh = self.render_height;
         const icx: i32 = @intCast(cx);
         const icy: i32 = @intCast(cy);
 
-        // Camera body outline (22x16)
-        const body_w: u32 = 22;
-        const body_h: u32 = 16;
+        // Camera body outline (22x16 logical)
+        const body_w: u32 = self.sc(22);
+        const body_h: u32 = self.sc(16);
         const bx = cx -| (body_w / 2);
-        const by = cy -| (body_h / 2) + 2;
-        const thick: u32 = 2;
+        const by = cy -| (body_h / 2) + self.sc(2);
+        const thick: u32 = @max(self.sc(2), 1);
 
         fillRect(data, stride, bx, by, body_w, thick, sw, sh, 0xFF, 0xFF, 0xFF); // top
         fillRect(data, stride, bx, by + body_h -| thick, body_w, thick, sw, sh, 0xFF, 0xFF, 0xFF); // bottom
@@ -823,49 +903,54 @@ pub const Overlay = struct {
         fillRect(data, stride, bx + body_w -| thick, by, thick, body_h, sw, sh, 0xFF, 0xFF, 0xFF); // right
 
         // Viewfinder bump on top
-        const bump_w: u32 = 8;
-        const bump_h: u32 = 4;
-        fillRect(data, stride, cx -| (bump_w / 2), by -| bump_h + 1, bump_w, bump_h, sw, sh, 0xFF, 0xFF, 0xFF);
+        const bump_w: u32 = self.sc(8);
+        const bump_h: u32 = self.sc(4);
+        fillRect(data, stride, cx -| (bump_w / 2), by -| bump_h + self.sc(1), bump_w, bump_h, sw, sh, 0xFF, 0xFF, 0xFF);
 
         // Lens circle (ring)
-        drawCircle(data, stride, icx, icy + 2, 5, sw, sh, 0xFF, 0xFF, 0xFF, 2);
+        drawCircle(data, stride, icx, icy + @as(i32, @intCast(self.sc(2))), @as(i32, @intCast(self.sc(5))), sw, sh, 0xFF, 0xFF, 0xFF, @intCast(@max(self.sc(2), 1)));
 
         // Inner lens dot
-        drawFilledCircle(data, stride, icx, icy + 2, 1, sw, sh, 0xFF, 0xFF, 0xFF);
+        drawFilledCircle(data, stride, icx, icy + @as(i32, @intCast(self.sc(2))), @as(i32, @intCast(@max(self.sc(1), 1))), sw, sh, 0xFF, 0xFF, 0xFF);
     }
 
-    /// Record icon: filled red circle.
-    fn drawRecordIcon(data: []u8, stride: u32, cx: u32, cy: u32, sw: u32, sh: u32) void {
-        drawFilledCircle(data, stride, @intCast(cx), @intCast(cy), 10, sw, sh, 0xF0, 0x40, 0x40);
+    /// Record icon: filled red circle. cx/cy are in render-space pixels.
+    fn drawRecordIcon(self: *const Overlay, data: []u8, stride: u32, cx: u32, cy: u32) void {
+        const sw = self.render_width;
+        const sh = self.render_height;
+        drawFilledCircle(data, stride, @intCast(cx), @intCast(cy), @as(i32, @intCast(self.sc(10))), sw, sh, 0xF0, 0x40, 0x40);
     }
 
     fn drawToolbar(self: *Overlay, data: []u8, stride: u32) void {
         if (self.buttonRect(.screenshot) == null) return;
-        const sw = self.surface_width;
-        const sh = self.surface_height;
+        const sw = self.render_width;
+        const sh = self.render_height;
+        const radius = self.sc(button_corner_radius);
+        const stroke_thick = @max(self.sc(2), 1);
 
         inline for (.{ ToolbarButton.screenshot, ToolbarButton.record }) |btn| {
             if (self.buttonRect(btn)) |br| {
+                const rbr = self.toRenderRect(br);
                 const is_hovered = self.hovered_button != null and self.hovered_button.? == btn;
 
                 // Button background
                 if (is_hovered) {
-                    fillRoundedRectAlpha(data, stride, br.x, br.y, br.width, br.height, sw, sh, button_corner_radius, 0x50, 0x50, 0x50, 0xE0);
+                    fillRoundedRectAlpha(data, stride, rbr.x, rbr.y, rbr.width, rbr.height, sw, sh, radius, 0x50, 0x50, 0x50, 0xE0);
                 } else {
-                    fillRoundedRectAlpha(data, stride, br.x, br.y, br.width, br.height, sw, sh, button_corner_radius, 0x1E, 0x1E, 0x1E, 0xD8);
+                    fillRoundedRectAlpha(data, stride, rbr.x, rbr.y, rbr.width, rbr.height, sw, sh, radius, 0x1E, 0x1E, 0x1E, 0xD8);
                 }
 
                 // Border for visibility when buttons are inside the selection
                 if (self.toolbarInsideSelection()) {
-                    strokeRoundedRect(data, stride, br.x, br.y, br.width, br.height, sw, sh, button_corner_radius, 2, 0xFF, 0xFF, 0xFF, 0x40);
+                    strokeRoundedRect(data, stride, rbr.x, rbr.y, rbr.width, rbr.height, sw, sh, radius, stroke_thick, 0xFF, 0xFF, 0xFF, 0x40);
                 }
 
                 // Icon centered in button
-                const icon_cx = br.x + br.width / 2;
-                const icon_cy = br.y + br.height / 2;
+                const icon_cx = rbr.x + rbr.width / 2;
+                const icon_cy = rbr.y + rbr.height / 2;
                 switch (btn) {
-                    .screenshot => drawCameraIcon(data, stride, icon_cx, icon_cy, sw, sh),
-                    .record => drawRecordIcon(data, stride, icon_cx, icon_cy, sw, sh),
+                    .screenshot => self.drawCameraIcon(data, stride, icon_cx, icon_cy),
+                    .record => self.drawRecordIcon(data, stride, icon_cx, icon_cy),
                 }
             }
         }
@@ -903,6 +988,8 @@ pub const Overlay = struct {
             if (buf.*) |*b| b.destroy();
         }
         if (self.dark_bg) |bg| self.allocator.free(bg);
+        if (self.fractional_scale) |fs| wl.c.wp_fractional_scale_v1_destroy(fs);
+        if (self.viewport) |vp| wl.c.wp_viewport_destroy(vp);
         if (self.layer_surface) |ls| wl.c.zwlr_layer_surface_v1_destroy(ls);
         if (self.surface) |s| wl.c.wl_surface_destroy(s);
     }
@@ -945,6 +1032,15 @@ fn layerSurfaceClosed(data: ?*anyopaque, _: ?*wl.c.zwlr_layer_surface_v1) callco
     self.action = .cancel;
     self.done = true;
 }
+
+fn fractionalScalePreferred(data: ?*anyopaque, _: ?*wl.c.wp_fractional_scale_v1, scale: u32) callconv(.c) void {
+    const self: *Overlay = @ptrCast(@alignCast(data));
+    self.scale_120 = scale;
+}
+
+const fractional_scale_listener: wl.c.wp_fractional_scale_v1_listener = .{
+    .preferred_scale = fractionalScalePreferred,
+};
 
 const layer_surface_listener: wl.c.zwlr_layer_surface_v1_listener = .{
     .configure = layerSurfaceConfigure,
