@@ -52,6 +52,12 @@ pub const CaptureState = struct {
             0, // overlay_cursor: 0 = no cursor, 1 = include cursor
             output,
         ) orelse return error.FailedToCreateFrame;
+        defer {
+            if (self.screencopy_frame) |f| {
+                wl.c.zwlr_screencopy_frame_v1_destroy(f);
+                self.screencopy_frame = null;
+            }
+        }
 
         _ = wl.c.zwlr_screencopy_frame_v1_add_listener(
             self.screencopy_frame.?,
@@ -107,6 +113,16 @@ pub const CaptureState = struct {
             @ptrCast(source),
             0, // no options: don't paint cursors
         ) orelse return error.FailedToCreateCaptureSession;
+        defer {
+            if (self.ext_frame) |f| {
+                wl.c.ext_image_copy_capture_frame_v1_destroy(f);
+                self.ext_frame = null;
+            }
+            if (self.ext_session) |s| {
+                wl.c.ext_image_copy_capture_session_v1_destroy(s);
+                self.ext_session = null;
+            }
+        }
 
         _ = wl.c.ext_image_copy_capture_session_v1_add_listener(
             self.ext_session.?,
