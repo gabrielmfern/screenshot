@@ -36,15 +36,13 @@ pub const Overlay = struct {
     surface_height: u32 = 0,
     configured: bool = false,
 
-    // Buffer is sized to match the compositor's preferred fractional scale
-    // (wp_fractional_scale_v1) and mapped back to logical size via wp_viewporter.
-    // `scale_120` is in 1/120ths of a unit: 120 = 1.0x, 150 = 1.25x, 240 = 2.0x.
-    // `render_*` are the buffer's pixel dimensions, frozen at init time.
+    // Buffer is sized to match the captured screenshot's physical pixel
+    // dimensions (which match the output's physical size), and mapped back
+    // to the logical surface size via wp_viewporter. This gives us 1:1
+    // pixels under fractional output scaling without depending on
+    // wp_fractional_scale_v1's unreliable delivery for layer surfaces.
     viewporter: ?*wl.c.wp_viewporter = null,
-    fractional_scale_mgr: ?*wl.c.wp_fractional_scale_manager_v1 = null,
     viewport: ?*wl.c.wp_viewport = null,
-    fractional_scale: ?*wl.c.wp_fractional_scale_v1 = null,
-    scale_120: u32 = 120,
     render_width: u32 = 0,
     render_height: u32 = 0,
 
@@ -284,16 +282,6 @@ pub const Overlay = struct {
             self,
         );
 
-        // Set up viewporter + fractional-scale BEFORE the first commit so the
-        // compositor can start delivering preferred_scale events right away.
-        // Per the fractional-scale protocol, wl_surface.buffer_scale must stay
-        // at 1 when using the viewporter-based path.
-        if (self.fractional_scale_mgr) |mgr| {
-            self.fractional_scale = wl.c.wp_fractional_scale_manager_v1_get_fractional_scale(mgr, self.surface.?);
-            if (self.fractional_scale) |fs| {
-                _ = wl.c.wp_fractional_scale_v1_add_listener(fs, &fractional_scale_listener, self);
-            }
-        }
         if (self.viewporter) |vp| {
             self.viewport = wl.c.wp_viewporter_get_viewport(vp, self.surface.?);
         }
@@ -314,33 +302,27 @@ pub const Overlay = struct {
                 return error.WaylandRoundtripFailed;
         }
 
-        // preferred_scale has no ordering guarantee vs. configure, so flush
-        // one more roundtrip to collect any straggler events. If nothing
-        // arrives (compositor doesn't support it or hasn't decided yet),
-        // scale_120 stays at its default of 120 (1.0x).
-        if (self.fractional_scale != null) {
-            if (wl.c.wl_display_roundtrip(self.display) == -1)
-                return error.WaylandRoundtripFailed;
-        }
-
-        // Without a viewport we can't safely describe a non-1x buffer, so
-        // fall back to 1:1 rendering regardless of any reported scale.
-        if (self.viewport == null) self.scale_120 = 120;
-        // Sanity-clamp against nonsense values.
-        self.scale_120 = @min(@max(self.scale_120, 60), 600);
-
-        self.render_width = @intCast((@as(u64, self.surface_width) * self.scale_120) / 120);
-        self.render_height = @intCast((@as(u64, self.surface_height) * self.scale_120) / 120);
-
-        if (self.viewport) |vp| {
-            wl.c.wp_viewport_set_destination(vp, @intCast(self.surface_width), @intCast(self.surface_height));
+        // Render at the screenshot's physical resolution so our buffer is
+        // 1:1 with the output's physical pixels. We can only do this if the
+        // compositor supports wp_viewporter to map it back to logical size;
+        // otherwise we must render at surface_* (and accept compositor
+        // upscaling under fractional output scaling).
+        const use_viewport = self.viewport != null and
+            (self.screenshot.width != self.surface_width or self.screenshot.height != self.surface_height);
+        if (use_viewport) {
+            self.render_width = self.screenshot.width;
+            self.render_height = self.screenshot.height;
+            wl.c.wp_viewport_set_destination(self.viewport.?, @intCast(self.surface_width), @intCast(self.surface_height));
             wl.c.wl_surface_set_buffer_scale(self.surface.?, 1);
+        } else {
+            self.render_width = self.surface_width;
+            self.render_height = self.surface_height;
         }
 
-        std.log.info("overlay: surface {d}x{d} logical, buffer {d}x{d} (scale {d}/120)", .{
-            self.surface_width, self.surface_height,
-            self.render_width,  self.render_height,
-            self.scale_120,
+        std.log.info("overlay: surface {d}x{d} logical, buffer {d}x{d}, screenshot {d}x{d}", .{
+            self.surface_width,    self.surface_height,
+            self.render_width,     self.render_height,
+            self.screenshot.width, self.screenshot.height,
         });
 
         try self.createBuffers();
@@ -988,7 +970,6 @@ pub const Overlay = struct {
             if (buf.*) |*b| b.destroy();
         }
         if (self.dark_bg) |bg| self.allocator.free(bg);
-        if (self.fractional_scale) |fs| wl.c.wp_fractional_scale_v1_destroy(fs);
         if (self.viewport) |vp| wl.c.wp_viewport_destroy(vp);
         if (self.layer_surface) |ls| wl.c.zwlr_layer_surface_v1_destroy(ls);
         if (self.surface) |s| wl.c.wl_surface_destroy(s);
@@ -1032,15 +1013,6 @@ fn layerSurfaceClosed(data: ?*anyopaque, _: ?*wl.c.zwlr_layer_surface_v1) callco
     self.action = .cancel;
     self.done = true;
 }
-
-fn fractionalScalePreferred(data: ?*anyopaque, _: ?*wl.c.wp_fractional_scale_v1, scale: u32) callconv(.c) void {
-    const self: *Overlay = @ptrCast(@alignCast(data));
-    self.scale_120 = scale;
-}
-
-const fractional_scale_listener: wl.c.wp_fractional_scale_v1_listener = .{
-    .preferred_scale = fractionalScalePreferred,
-};
 
 const layer_surface_listener: wl.c.zwlr_layer_surface_v1_listener = .{
     .configure = layerSurfaceConfigure,
