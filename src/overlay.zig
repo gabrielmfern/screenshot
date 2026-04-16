@@ -37,11 +37,16 @@ pub const Overlay = struct {
     surface_height: u32 = 0,
     configured: bool = false,
 
-    // Buffer is rendered at `scale` times the logical surface size so the
-    // overlay stays crisp under compositor magnification (e.g. Hyprland zoom)
-    // and fractional output scaling. `wl_surface_set_buffer_scale` is set to
-    // match this value. `render_*` are `surface_* * scale` once configured.
-    scale: i32 = 2,
+    // Buffer is rendered at the compositor's preferred fractional scale (if
+    // advertised) and mapped back to logical size via wp_viewporter. This keeps
+    // the overlay crisp on HiDPI/fractional outputs without extra allocation
+    // when the scale is 1.0. `scale_120` is in 1/120ths of a unit (so 120 =
+    // 1.0x, 180 = 1.5x, 240 = 2.0x — matching wp_fractional_scale_v1).
+    viewporter: ?*wl.c.wp_viewporter = null,
+    fractional_scale_mgr: ?*wl.c.wp_fractional_scale_manager_v1 = null,
+    viewport: ?*wl.c.wp_viewport = null,
+    fractional_scale: ?*wl.c.wp_fractional_scale_v1 = null,
+    scale_120: u32 = 120,
     render_width: u32 = 0,
     render_height: u32 = 0,
 
@@ -281,6 +286,19 @@ pub const Overlay = struct {
             self,
         );
 
+        // Subscribe to the compositor's preferred fractional scale for this
+        // surface (if supported). The event can arrive before or with the
+        // first configure — we roundtrip below to collect it either way.
+        if (self.fractional_scale_mgr) |mgr| {
+            self.fractional_scale = wl.c.wp_fractional_scale_manager_v1_get_fractional_scale(mgr, self.surface.?);
+            if (self.fractional_scale) |fs| {
+                _ = wl.c.wp_fractional_scale_v1_add_listener(fs, &fractional_scale_listener, self);
+            }
+        }
+        if (self.viewporter) |vp| {
+            self.viewport = wl.c.wp_viewporter_get_viewport(vp, self.surface.?);
+        }
+
         wl.c.wl_surface_commit(self.surface.?);
 
         self.pointer = wl.c.wl_seat_get_pointer(self.seat);
@@ -297,9 +315,16 @@ pub const Overlay = struct {
                 return error.WaylandRoundtripFailed;
         }
 
-        self.render_width = self.surface_width * @as(u32, @intCast(self.scale));
-        self.render_height = self.surface_height * @as(u32, @intCast(self.scale));
-        wl.c.wl_surface_set_buffer_scale(self.surface.?, self.scale);
+        // Without a viewport we can't describe a non-1x buffer at a 1x surface
+        // size, so fall back to 1:1 rendering rather than misrepresent the buffer.
+        if (self.viewport == null) self.scale_120 = 120;
+
+        self.render_width = @intCast((@as(u64, self.surface_width) * self.scale_120 + 60) / 120);
+        self.render_height = @intCast((@as(u64, self.surface_height) * self.scale_120 + 60) / 120);
+
+        if (self.viewport) |vp| {
+            wl.c.wp_viewport_set_destination(vp, @intCast(self.surface_width), @intCast(self.surface_height));
+        }
 
         try self.createBuffers();
         try self.preRenderDarkBackground();
@@ -373,8 +398,9 @@ pub const Overlay = struct {
     }
 
     /// Multiply a logical-space scalar to render space.
+    /// scale_120=120 → identity (no-op multiplication).
     fn sc(self: *const Overlay, v: u32) u32 {
-        return v * @as(u32, @intCast(self.scale));
+        return @intCast((@as(u64, v) * self.scale_120 + 60) / 120);
     }
 
     /// Scale a surface-space rect to render space.
@@ -944,6 +970,8 @@ pub const Overlay = struct {
             if (buf.*) |*b| b.destroy();
         }
         if (self.dark_bg) |bg| self.allocator.free(bg);
+        if (self.fractional_scale) |fs| wl.c.wp_fractional_scale_v1_destroy(fs);
+        if (self.viewport) |vp| wl.c.wp_viewport_destroy(vp);
         if (self.layer_surface) |ls| wl.c.zwlr_layer_surface_v1_destroy(ls);
         if (self.surface) |s| wl.c.wl_surface_destroy(s);
     }
@@ -986,6 +1014,15 @@ fn layerSurfaceClosed(data: ?*anyopaque, _: ?*wl.c.zwlr_layer_surface_v1) callco
     self.action = .cancel;
     self.done = true;
 }
+
+fn fractionalScalePreferred(data: ?*anyopaque, _: ?*wl.c.wp_fractional_scale_v1, scale: u32) callconv(.c) void {
+    const self: *Overlay = @ptrCast(@alignCast(data));
+    self.scale_120 = scale;
+}
+
+const fractional_scale_listener: wl.c.wp_fractional_scale_v1_listener = .{
+    .preferred_scale = fractionalScalePreferred,
+};
 
 const layer_surface_listener: wl.c.zwlr_layer_surface_v1_listener = .{
     .configure = layerSurfaceConfigure,
