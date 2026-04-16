@@ -10,6 +10,7 @@ const Recorder = @import("recorder.zig").Recorder;
 const RecordingOverlay = @import("recording_overlay.zig").RecordingOverlay;
 const Clipboard = @import("clipboard.zig").Clipboard;
 const Audio = @import("audio.zig").Audio;
+const state = @import("state.zig");
 
 // ── Timer ────────────────────────────────────────────────────────────────────
 
@@ -405,6 +406,7 @@ pub fn main() !void {
             .layer_shell = layer_shell.?,
             .output = wl_output.?,
             .screenshot = &screenshot,
+            .selection = state.loadLastRect(allocator),
         };
         try overlay.init(allocator);
 
@@ -423,6 +425,7 @@ pub fn main() !void {
 
         if (result.selection) |sel| {
             overlay_selection = sel;
+            state.saveLastRect(sel);
             const mapped_sel = mapRectBetweenSpaces(
                 sel,
                 result.surface_width,

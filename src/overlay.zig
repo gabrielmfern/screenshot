@@ -290,7 +290,16 @@ pub const Overlay = struct {
         try self.createBuffers();
         try self.preRenderDarkBackground();
 
-        // Initial frame: just the darkened background
+        // Clamp any pre-populated selection (e.g. restored from previous session)
+        // against the now-known surface size so later logic (hit testing, toolbar
+        // placement) sees a well-formed rect.
+        if (self.selection) |sel| {
+            const clamped = sel.clampToBounds(self.surface_width, self.surface_height);
+            self.selection = if (clamped.isEmpty()) null else clamped;
+        }
+
+        // Initial frame: either just the darkened background, or the background
+        // plus any restored selection.
         self.renderToBuffer();
         self.commitBuffer();
     }
