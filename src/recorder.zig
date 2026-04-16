@@ -140,7 +140,7 @@ pub const Recorder = struct {
         self.ext_session = wl.c.ext_image_copy_capture_manager_v1_create_session(
             self.capture_manager.?,
             @ptrCast(source),
-            0,
+            1, // paint cursors
         ) orelse return error.FailedToCreateCaptureSession;
 
         _ = wl.c.ext_image_copy_capture_session_v1_add_listener(
@@ -166,7 +166,7 @@ pub const Recorder = struct {
         // Capture one frame to get buffer constraints, then destroy it.
         const frame = wl.c.zwlr_screencopy_manager_v1_capture_output(
             self.screencopy_manager.?,
-            0,
+            1, // overlay cursor
             self.output,
         ) orelse return error.FailedToCreateFrame;
 
@@ -411,7 +411,7 @@ pub const Recorder = struct {
 
         const frame = wl.c.zwlr_screencopy_manager_v1_capture_output(
             self.screencopy_manager.?,
-            0,
+            1, // overlay cursor
             self.output,
         ) orelse return false;
 
