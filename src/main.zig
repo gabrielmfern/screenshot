@@ -40,8 +40,6 @@ var capture_manager: ?*wl.c.ext_image_copy_capture_manager_v1 = null;
 var source_manager: ?*wl.c.ext_output_image_capture_source_manager_v1 = null;
 var screencopy_manager: ?*wl.c.zwlr_screencopy_manager_v1 = null;
 var data_control_manager: ?*wl.c.ext_data_control_manager_v1 = null;
-var viewporter: ?*wl.c.wp_viewporter = null;
-var fractional_scale_manager: ?*wl.c.wp_fractional_scale_manager_v1 = null;
 
 // ── Registry listener ───────────────────────────────────────────────────────
 
@@ -86,8 +84,6 @@ fn registryGlobal(
     const source_mgr_info = BindingInfo(wl.c.ext_output_image_capture_source_manager_v1).new(&wl.c.ext_output_image_capture_source_manager_v1_interface, 1);
     const screencopy_info = BindingInfo(wl.c.zwlr_screencopy_manager_v1).new(&wl.c.zwlr_screencopy_manager_v1_interface, 3);
     const data_control_info = BindingInfo(wl.c.ext_data_control_manager_v1).new(&wl.c.ext_data_control_manager_v1_interface, 1);
-    const viewporter_info = BindingInfo(wl.c.wp_viewporter).new(&wl.c.wp_viewporter_interface, 1);
-    const fractional_scale_info = BindingInfo(wl.c.wp_fractional_scale_manager_v1).new(&wl.c.wp_fractional_scale_manager_v1_interface, 1);
 
     if (compositor_info.is(iface)) {
         wl_compositor = compositor_info.bind(registry, name);
@@ -110,10 +106,6 @@ fn registryGlobal(
         screencopy_manager = screencopy_info.bind(registry, name);
     } else if (data_control_info.is(iface)) {
         data_control_manager = data_control_info.bind(registry, name);
-    } else if (viewporter_info.is(iface)) {
-        viewporter = viewporter_info.bind(registry, name);
-    } else if (fractional_scale_info.is(iface)) {
-        fractional_scale_manager = fractional_scale_info.bind(registry, name);
     }
 }
 
@@ -415,8 +407,6 @@ pub fn main() !void {
             .output = wl_output.?,
             .screenshot = &screenshot,
             .selection = state.loadLastRect(allocator),
-            .viewporter = viewporter,
-            .fractional_scale_mgr = fractional_scale_manager,
         };
         try overlay.init(allocator);
 
