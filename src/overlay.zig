@@ -379,9 +379,11 @@ pub const Overlay = struct {
                 const src_offset = @as(usize, src_y) * self.screenshot.stride + @as(usize, src_x) * Image.bpp;
 
                 if (src_offset + 3 < self.screenshot.data.len and dst_offset + 3 < bg.len) {
-                    bg[dst_offset + 0] = self.screenshot.data[src_offset + 0] / 3;
+                    // screenshot.data is RGBA; the overlay surface (ARGB8888)
+                    // reads as BGRA on display, so swap R↔B during the copy.
+                    bg[dst_offset + 0] = self.screenshot.data[src_offset + 2] / 3;
                     bg[dst_offset + 1] = self.screenshot.data[src_offset + 1] / 3;
-                    bg[dst_offset + 2] = self.screenshot.data[src_offset + 2] / 3;
+                    bg[dst_offset + 2] = self.screenshot.data[src_offset + 0] / 3;
                     bg[dst_offset + 3] = 0xFF;
                 }
             }
@@ -519,15 +521,14 @@ pub const Overlay = struct {
                 if (src_row_start + row_bytes <= self.screenshot.data.len and
                     dst_row_start + row_bytes <= data.len)
                 {
-                    @memcpy(
-                        data[dst_row_start..][0..row_bytes],
-                        self.screenshot.data[src_row_start..][0..row_bytes],
-                    );
-                    // Fix alpha channel (screenshot might be XRGB with alpha=0)
-                    var x: usize = dst_row_start;
-                    const end = dst_row_start + row_bytes;
-                    while (x + 3 < end) : (x += bpp) {
-                        data[x + 3] = 0xFF;
+                    // screenshot.data is RGBA; overlay surface reads as BGRA,
+                    // so swap R↔B and force alpha while copying.
+                    var x: usize = 0;
+                    while (x + bpp <= row_bytes) : (x += bpp) {
+                        data[dst_row_start + x + 0] = self.screenshot.data[src_row_start + x + 2];
+                        data[dst_row_start + x + 1] = self.screenshot.data[src_row_start + x + 1];
+                        data[dst_row_start + x + 2] = self.screenshot.data[src_row_start + x + 0];
+                        data[dst_row_start + x + 3] = 0xFF;
                     }
                 }
             } else {
@@ -540,9 +541,10 @@ pub const Overlay = struct {
                     const src_offset = @as(usize, src_y) * self.screenshot.stride + @as(usize, src_x) * Image.bpp;
 
                     if (src_offset + 3 < self.screenshot.data.len and dst_offset + 3 < data.len) {
-                        data[dst_offset + 0] = self.screenshot.data[src_offset + 0];
+                        // RGBA → BGRA swap (see preRenderDarkBackground)
+                        data[dst_offset + 0] = self.screenshot.data[src_offset + 2];
                         data[dst_offset + 1] = self.screenshot.data[src_offset + 1];
-                        data[dst_offset + 2] = self.screenshot.data[src_offset + 2];
+                        data[dst_offset + 2] = self.screenshot.data[src_offset + 0];
                         data[dst_offset + 3] = 0xFF;
                     }
                 }
