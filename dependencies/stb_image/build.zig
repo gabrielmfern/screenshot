@@ -4,18 +4,14 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const lib = b.addLibrary(.{
-        .name = "stb_image",
-        .root_module = b.addModule("stb_image", .{
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
-        .linkage = .static,
+    const module = b.addModule("stb_image", .{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
     });
 
-    lib.addIncludePath(b.path("."));
-    lib.addCSourceFile(.{
+    module.addIncludePath(b.path("."));
+    module.addCSourceFile(.{
         .file = b.path("stb_image.c"),
         .flags = &.{
             "-fno-sanitize=alignment",
@@ -23,13 +19,19 @@ pub fn build(b: *std.Build) void {
             "-fno-sanitize=pointer-overflow",
         },
     });
-    lib.addCSourceFile(.{
+    module.addCSourceFile(.{
         .file = b.path("stb_image_write.c"),
         .flags = &.{
             "-fno-sanitize=alignment",
             "-fno-sanitize=shift",
             "-fno-sanitize=pointer-overflow",
         },
+    });
+
+    const lib = b.addLibrary(.{
+        .name = "stb_image",
+        .root_module = module,
+        .linkage = .static,
     });
 
     lib.installHeader(b.path("stb_image.h"), "stb_image.h");
