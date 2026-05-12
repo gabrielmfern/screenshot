@@ -2,7 +2,7 @@
     .name = .screenshot,
     .version = "0.0.0",
     .fingerprint = 0x58991e41152b737d,
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .wayland = .{
             .url = "git+https://codeberg.org/ifreund/zig-wayland.git#e57368ecbda85d564362779b253b744260a4b053",
