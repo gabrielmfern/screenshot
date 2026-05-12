@@ -291,7 +291,7 @@ fn scaleCeil(coord: u32, src_extent: u32, dst_extent: u32) u32 {
 }
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer {
         if (gpa.deinit() == .leak) {
             std.log.err("memory leak detected", .{});
