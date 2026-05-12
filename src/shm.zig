@@ -6,8 +6,8 @@ const wl = @import("wayland.zig");
 /// Creates an anonymous file using memfd_create for use as a Wayland SHM pool backing store.
 pub fn createShmFile(size: usize) !posix.fd_t {
     const fd = try posix.memfd_create("screenshot-shm", 0);
-    errdefer posix.close(fd);
-    try posix.ftruncate(fd, @intCast(size));
+    errdefer _ = std.c.close(fd);
+    if (std.c.ftruncate(fd, @intCast(size)) != 0) return error.FtruncateFailed;
     return fd;
 }
 
@@ -29,12 +29,12 @@ pub const ShmBuffer = struct {
         const size: usize = @as(usize, h) * stride;
 
         const fd = try createShmFile(size);
-        errdefer posix.close(fd);
+        errdefer _ = std.c.close(fd);
 
         const data = try posix.mmap(
             null,
             size,
-            posix.PROT.READ | posix.PROT.WRITE,
+            .{ .READ = true, .WRITE = true },
             .{ .TYPE = .SHARED },
             fd,
             0,
@@ -70,6 +70,6 @@ pub const ShmBuffer = struct {
         wl.c.wl_buffer_destroy(self.wl_buffer);
         wl.c.wl_shm_pool_destroy(self.pool);
         posix.munmap(self.data);
-        posix.close(self.fd);
+        _ = std.c.close(self.fd);
     }
 };

@@ -15,14 +15,15 @@ const state = @import("state.zig");
 // ── Timer ────────────────────────────────────────────────────────────────────
 
 const Timer = struct {
-    start_ns: i128,
+    start_ns: i96,
+    io: std.Io,
 
-    fn start() Timer {
-        return .{ .start_ns = std.time.nanoTimestamp() };
+    fn start(io: std.Io) Timer {
+        return .{ .start_ns = std.Io.Clock.now(.awake, io).nanoseconds, .io = io };
     }
 
     fn elapsedMs(self: Timer) f64 {
-        const end_ns = std.time.nanoTimestamp();
+        const end_ns = std.Io.Clock.now(.awake, self.io).nanoseconds;
         return @as(f64, @floatFromInt(end_ns - self.start_ns)) / 1_000_000.0;
     }
 };
@@ -122,38 +123,31 @@ const registry_listener: wl.c.wl_registry_listener = .{
 
 // ── Output path generation ──────────────────────────────────────────────────
 
-fn getPicturesDir(allocator: std.mem.Allocator) ![]const u8 {
-    var child = std.process.Child.init(&.{ "xdg-user-dir", "PICTURES" }, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-    child.spawn() catch return error.XdgUserDirFailed;
+fn getXdgUserDir(allocator: std.mem.Allocator, io: std.Io, kind: []const u8) ![]const u8 {
+    const result = std.process.run(allocator, io, .{
+        .argv = &.{ "xdg-user-dir", kind },
+        .stdout_limit = .limited(4096),
+    }) catch return error.XdgUserDirFailed;
+    defer allocator.free(result.stderr);
+    defer allocator.free(result.stdout);
 
-    var buf: [4096]u8 = undefined;
-    const n = if (child.stdout) |stdout|
-        stdout.readAll(&buf) catch 0
-    else
-        0;
-    _ = child.wait() catch {};
-
-    if (n > 0) {
-        const trimmed = std.mem.trimRight(u8, buf[0..n], "\n\r");
-        if (trimmed.len > 0) {
-            return try allocator.dupe(u8, trimmed);
-        }
-    }
-    return error.XdgUserDirFailed;
+    const trimmed = std.mem.trimEnd(u8, result.stdout, "\n\r");
+    if (trimmed.len == 0) return error.XdgUserDirFailed;
+    return try allocator.dupe(u8, trimmed);
 }
 
-fn getFallbackPicturesDir(allocator: std.mem.Allocator) ![]const u8 {
-    const home = posix.getenv("HOME") orelse return error.NoHomeDir;
+fn getFallbackPicturesDir(allocator: std.mem.Allocator, env: std.process.Environ) ![]const u8 {
+    const home = env.getPosix("HOME") orelse return error.NoHomeDir;
     return try allocator.dupe(u8, home);
 }
 
-fn generateOutputPath(allocator: std.mem.Allocator, width: u32, height: u32) ![:0]u8 {
-    const pictures_dir = getPicturesDir(allocator) catch try getFallbackPicturesDir(allocator);
-    defer allocator.free(pictures_dir);
+fn resolveDir(allocator: std.mem.Allocator, io: std.Io, env: std.process.Environ, kind: []const u8) ![]const u8 {
+    return getXdgUserDir(allocator, io, kind) catch try getFallbackPicturesDir(allocator, env);
+}
 
-    const timestamp = std.time.timestamp();
+fn generateOutputPath(allocator: std.mem.Allocator, io: std.Io, pictures_dir: []const u8, width: u32, height: u32) ![:0]u8 {
+    const now_ns = std.Io.Clock.now(.real, io).nanoseconds;
+    const timestamp: i64 = @intCast(@divFloor(now_ns, std.time.ns_per_s));
     const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = @intCast(timestamp) };
     const day_seconds = epoch_seconds.getDaySeconds();
     const year_day = epoch_seconds.getEpochDay().calculateYearDay();
@@ -177,11 +171,9 @@ fn generateOutputPath(allocator: std.mem.Allocator, width: u32, height: u32) ![:
     );
 }
 
-fn generateRecordingPath(allocator: std.mem.Allocator) ![:0]u8 {
-    const videos_dir = getVideosDir(allocator) catch try getFallbackPicturesDir(allocator);
-    defer allocator.free(videos_dir);
-
-    const timestamp = std.time.timestamp();
+fn generateRecordingPath(allocator: std.mem.Allocator, io: std.Io, videos_dir: []const u8) ![:0]u8 {
+    const now_ns = std.Io.Clock.now(.real, io).nanoseconds;
+    const timestamp: i64 = @intCast(@divFloor(now_ns, std.time.ns_per_s));
     const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = @intCast(timestamp) };
     const day_seconds = epoch_seconds.getDaySeconds();
     const year_day = epoch_seconds.getEpochDay().calculateYearDay();
@@ -203,39 +195,14 @@ fn generateRecordingPath(allocator: std.mem.Allocator) ![:0]u8 {
     );
 }
 
-fn getVideosDir(allocator: std.mem.Allocator) ![]const u8 {
-    var child = std.process.Child.init(&.{ "xdg-user-dir", "VIDEOS" }, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-    child.spawn() catch return error.XdgUserDirFailed;
-
-    var buf: [4096]u8 = undefined;
-    const n = if (child.stdout) |stdout|
-        stdout.readAll(&buf) catch 0
-    else
-        0;
-    _ = child.wait() catch {};
-
-    if (n > 0) {
-        const trimmed = std.mem.trimRight(u8, buf[0..n], "\n\r");
-        if (trimmed.len > 0) {
-            return try allocator.dupe(u8, trimmed);
-        }
-    }
-    return error.XdgUserDirFailed;
-}
-
 /// Copy file data to the Wayland clipboard natively via ext-data-control-v1.
 /// Forks a background process that serves clipboard requests until cancelled.
 /// After this returns, the parent must NOT disconnect the Wayland display
 /// (the child process needs the connection to serve paste requests).
-fn copyFileToClipboard(allocator: std.mem.Allocator, path: [:0]const u8, mime_type: [*:0]const u8) !void {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-
+fn copyFileToClipboard(allocator: std.mem.Allocator, io: std.Io, path: [:0]const u8, mime_type: [*:0]const u8) !void {
     // After fork(), the child has its own copy-on-write pages, so the
     // parent can safely free its copy.
-    const file_data = try file.readToEndAlloc(allocator, 512 * 1024 * 1024);
+    const file_data = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(512 * 1024 * 1024));
     defer allocator.free(file_data);
 
     try copyDataToClipboard(mime_type, file_data);
@@ -290,17 +257,13 @@ fn scaleCeil(coord: u32, src_extent: u32, dst_extent: u32) u32 {
     return @intCast(scaled);
 }
 
-pub fn main() !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer {
-        if (gpa.deinit() == .leak) {
-            std.log.err("memory leak detected", .{});
-        }
-    }
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
+    const env = init.minimal.environ;
 
     // Parse CLI args
-    var args = try std.process.argsWithAllocator(allocator);
+    var args = init.minimal.args.iterate();
     defer args.deinit();
     _ = args.next(); // skip program name
 
@@ -331,7 +294,7 @@ pub fn main() !void {
                 \\  Escape            Cancel
                 \\
             ;
-            _ = posix.write(posix.STDOUT_FILENO, help) catch {};
+            std.Io.File.stdout().writeStreamingAll(io, help) catch {};
             return;
         }
     }
@@ -410,7 +373,7 @@ pub fn main() !void {
             .layer_shell = layer_shell.?,
             .output = wl_output.?,
             .screenshot = &screenshot,
-            .selection = state.loadLastRect(allocator),
+            .selection = state.loadLastRect(allocator, io, env),
             .viewporter = viewporter,
         };
         try overlay.init(allocator);
@@ -430,7 +393,7 @@ pub fn main() !void {
 
         if (result.selection) |sel| {
             overlay_selection = sel;
-            state.saveLastRect(sel);
+            state.saveLastRect(sel, io, env);
             const mapped_sel = mapRectBetweenSpaces(
                 sel,
                 result.surface_width,
@@ -456,21 +419,24 @@ pub fn main() !void {
 
     switch (action) {
         .copy_to_clipboard => {
-            const timer = Timer.start();
+            const timer = Timer.start(io);
             const tmp_path = "/tmp/screenshot-clipboard.png";
             try save_target.savePng(tmp_path);
-            try copyFileToClipboard(allocator, tmp_path, "image/png");
+            try copyFileToClipboard(allocator, io, tmp_path, "image/png");
             clipboard_forked = true;
-            std.fs.deleteFileAbsolute(tmp_path) catch {};
+            std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {};
             Audio.play(.shutter);
             std.log.info("copied to clipboard in {d:.1}ms", .{timer.elapsedMs()});
         },
         .save_to_file, .take_screenshot => {
-            const timer = Timer.start();
+            const timer = Timer.start(io);
             const owned_path = if (output_path_arg) |p|
                 try allocator.dupeZ(u8, p)
-            else
-                try generateOutputPath(allocator, save_target.width, save_target.height);
+            else blk: {
+                const pictures_dir = try resolveDir(allocator, io, env, "PICTURES");
+                defer allocator.free(pictures_dir);
+                break :blk try generateOutputPath(allocator, io, pictures_dir, save_target.width, save_target.height);
+            };
             defer allocator.free(owned_path);
 
             try save_target.savePng(owned_path.ptr);
@@ -478,7 +444,7 @@ pub fn main() !void {
             std.log.info("saved to {s} in {d:.1}ms", .{ owned_path, timer.elapsedMs() });
         },
         .record => {
-            const total_timer = Timer.start();
+            const total_timer = Timer.start(io);
 
             const overlay_sel = overlay_selection orelse {
                 std.log.info("no selection for recording", .{});
@@ -490,6 +456,7 @@ pub fn main() !void {
             std.log.info("starting recording ({d}x{d} at {d},{d})", .{ capture_sel.width, capture_sel.height, capture_sel.x, capture_sel.y });
             var recorder = Recorder.start(
                 allocator,
+                io,
                 capture_sel,
                 wl_display.?,
                 wl_shm.?,
@@ -515,7 +482,7 @@ pub fn main() !void {
                 .output = wl_output.?,
                 .region = overlay_sel,
             };
-            try rec_overlay.init(allocator);
+            try rec_overlay.init(allocator, io);
 
             // Main recording loop: capture frames + handle overlay events
             var recording = true;
@@ -555,38 +522,44 @@ pub fn main() !void {
             _ = wl.c.wl_display_flush(wl_display);
 
             // Stop recorder (closes ffmpeg stdin, waits for muxing to finish)
-            var stop_timer = Timer.start();
+            var stop_timer = Timer.start(io);
             recorder.stop();
             Audio.play(.record_stop);
             std.log.info("recorder stopped in {d:.1}ms", .{stop_timer.elapsedMs()});
 
             // Move the recording to a permanent location
-            stop_timer = Timer.start();
-            const recording_path = generateRecordingPath(allocator) catch |err| {
+            stop_timer = Timer.start(io);
+            const videos_dir = resolveDir(allocator, io, env, "VIDEOS") catch |err| {
+                std.log.err("failed to resolve videos dir: {}", .{err});
+                return;
+            };
+            defer allocator.free(videos_dir);
+
+            const recording_path = generateRecordingPath(allocator, io, videos_dir) catch |err| {
                 std.log.err("failed to generate recording path: {}", .{err});
                 return;
             };
             defer allocator.free(recording_path);
 
             const file_size = blk: {
-                const stat = std.fs.cwd().statFile(recorder.getOutputPath()) catch |err| {
+                const stat = std.Io.Dir.cwd().statFile(io, recorder.getOutputPath(), .{}) catch |err| {
                     std.log.err("recording file not found: {}", .{err});
                     return;
                 };
                 break :blk stat.size;
             };
 
-            std.fs.copyFileAbsolute(recorder.getOutputPath(), recording_path, .{}) catch |err| {
+            std.Io.Dir.copyFileAbsolute(recorder.getOutputPath(), recording_path, io, .{}) catch |err| {
                 std.log.err("failed to copy recording to {s}: {}", .{ recording_path, err });
                 return;
             };
-            std.fs.deleteFileAbsolute(recorder.getOutputPath()) catch {};
+            std.Io.Dir.deleteFileAbsolute(io, recorder.getOutputPath()) catch {};
 
             const size_mb = @as(f64, @floatFromInt(file_size)) / (1024.0 * 1024.0);
             std.log.info("saved to {s} ({d:.1} MB) in {d:.1}ms", .{ recording_path, size_mb, stop_timer.elapsedMs() });
 
             // Copy file path to clipboard as text/uri-list
-            stop_timer = Timer.start();
+            stop_timer = Timer.start(io);
             const uri = std.fmt.allocPrint(allocator, "file://{s}\r\n", .{recording_path}) catch |err| {
                 std.log.err("failed to format URI: {}", .{err});
                 return;
@@ -622,7 +595,9 @@ pub fn main() !void {
 
 test "generateOutputPath produces valid filename with resolution and date" {
     const allocator = std.testing.allocator;
-    const path = try generateOutputPath(allocator, 1920, 1080);
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
+    const path = try generateOutputPath(allocator, io, "/tmp", 1920, 1080);
     defer allocator.free(path);
 
     // Should end with .png and contain the resolution
@@ -655,11 +630,13 @@ test "mapRectBetweenSpaces clamps to destination bounds" {
 
 test "generateOutputPath different resolutions" {
     const allocator = std.testing.allocator;
-    const p1 = try generateOutputPath(allocator, 2560, 1440);
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
+    const p1 = try generateOutputPath(allocator, io, "/tmp", 2560, 1440);
     defer allocator.free(p1);
     try std.testing.expect(std.mem.indexOf(u8, p1, "screenshot-2560x1440-") != null);
 
-    const p2 = try generateOutputPath(allocator, 800, 600);
+    const p2 = try generateOutputPath(allocator, io, "/tmp", 800, 600);
     defer allocator.free(p2);
     try std.testing.expect(std.mem.indexOf(u8, p2, "screenshot-800x600-") != null);
 }

@@ -20,7 +20,8 @@ pub const Audio = struct {
     /// Play a sound effect. Non-blocking: forks a child process to handle playback
     /// so the main thread returns immediately.
     pub fn play(sound: Sound) void {
-        const pid = posix.fork() catch return;
+        const pid = std.c.fork();
+        if (pid < 0) return;
         if (pid != 0) {
             // Parent: return immediately. We don't waitpid — let init reap the child.
             return;
@@ -28,7 +29,7 @@ pub const Audio = struct {
 
         // Child: play the sound and exit
         playSync(sound);
-        posix.exit(0);
+        std.c.exit(0);
     }
 
     fn playSync(sound: Sound) void {

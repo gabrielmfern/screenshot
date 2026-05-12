@@ -328,12 +328,15 @@ test "Image.savePng writes a valid file" {
     const test_path = "/tmp/screenshot_test_output.png";
     try img.savePng(test_path);
 
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
+
     // Verify the file exists and has a PNG header
-    const file = try std.fs.openFileAbsolute(test_path, .{});
-    defer file.close();
+    const file = try std.Io.Dir.openFileAbsolute(io, test_path, .{});
+    defer file.close(io);
 
     var header: [8]u8 = undefined;
-    const bytes_read = try file.readAll(&header);
+    const bytes_read = try file.readStreaming(io, &.{&header});
     try std.testing.expectEqual(@as(usize, 8), bytes_read);
 
     // PNG magic bytes
@@ -343,5 +346,5 @@ test "Image.savePng writes a valid file" {
     try std.testing.expectEqual(@as(u8, 'G'), header[3]);
 
     // Clean up
-    std.fs.deleteFileAbsolute(test_path) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, test_path) catch {};
 }

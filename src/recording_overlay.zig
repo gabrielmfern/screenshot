@@ -48,10 +48,11 @@ pub const RecordingOverlay = struct {
     region: Rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
 
     // Timer
-    start_time_ns: i128 = 0,
+    io: std.Io = undefined,
+    start_time_ns: i96 = 0,
     paused: bool = false,
-    paused_elapsed_ns: i128 = 0, // accumulated time before current pause
-    pause_start_ns: i128 = 0,
+    paused_elapsed_ns: i96 = 0, // accumulated time before current pause
+    pause_start_ns: i96 = 0,
 
     // Result
     action: RecordAction = .none,
@@ -142,9 +143,10 @@ pub const RecordingOverlay = struct {
         return null;
     }
 
-    pub fn init(self: *RecordingOverlay, allocator: std.mem.Allocator) !void {
+    pub fn init(self: *RecordingOverlay, allocator: std.mem.Allocator, io: std.Io) !void {
         self.allocator = allocator;
-        self.start_time_ns = std.time.nanoTimestamp();
+        self.io = io;
+        self.start_time_ns = std.Io.Clock.now(.awake, io).nanoseconds;
 
         self.cursor_theme = wl.c.wl_cursor_theme_load(null, 24, self.shm);
         self.cursor_surface = wl.c.wl_compositor_create_surface(self.compositor);
@@ -224,7 +226,7 @@ pub const RecordingOverlay = struct {
     }
 
     fn getElapsedSeconds(self: *const RecordingOverlay) u32 {
-        const now = std.time.nanoTimestamp();
+        const now = std.Io.Clock.now(.awake, self.io).nanoseconds;
         var elapsed = self.paused_elapsed_ns;
         if (!self.paused) {
             elapsed += now - self.start_time_ns - self.paused_elapsed_ns;
@@ -809,11 +811,11 @@ fn recPointerButton(data: ?*anyopaque, _: ?*wl.c.wl_pointer, _: u32, _: u32, but
                     // Handle pause state locally
                     if (self.paused) {
                         // Resume: account for pause duration
-                        self.paused_elapsed_ns += std.time.nanoTimestamp() - self.pause_start_ns;
+                        self.paused_elapsed_ns += std.Io.Clock.now(.awake, self.io).nanoseconds - self.pause_start_ns;
                         self.paused = false;
                     } else {
                         // Pause
-                        self.pause_start_ns = std.time.nanoTimestamp();
+                        self.pause_start_ns = std.Io.Clock.now(.awake, self.io).nanoseconds;
                         self.paused = true;
                     }
                     self.action = .pause;

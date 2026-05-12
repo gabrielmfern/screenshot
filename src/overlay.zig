@@ -1257,7 +1257,7 @@ const pointer_listener: wl.c.wl_pointer_listener = .{
 // ── Keyboard listener ───────────────────────────────────────────────────────
 
 fn kbKeymap(_: ?*anyopaque, _: ?*wl.c.wl_keyboard, _: u32, fd: i32, _: u32) callconv(.c) void {
-    posix.close(fd);
+    _ = std.c.close(fd);
 }
 
 fn kbEnter(_: ?*anyopaque, _: ?*wl.c.wl_keyboard, _: u32, _: ?*wl.c.wl_surface, _: [*c]wl.c.wl_array) callconv(.c) void {}

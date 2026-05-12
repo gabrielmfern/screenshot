@@ -79,6 +79,7 @@ pub const Recorder = struct {
     /// Start recording the given screen region to a temporary file.
     pub fn start(
         allocator: std.mem.Allocator,
+        io: std.Io,
         region: Rect,
         display: *wl.c.wl_display,
         shm: *wl.c.wl_shm,
@@ -90,7 +91,7 @@ pub const Recorder = struct {
         const output_path: [:0]const u8 = "/tmp/screenshot-recording.mp4";
 
         // Remove any previous recording
-        std.fs.deleteFileAbsolute(output_path) catch {};
+        std.Io.Dir.deleteFileAbsolute(io, output_path) catch {};
 
         const has_ext = capture_manager != null and source_manager != null;
         const backend: CaptureBackend = if (has_ext) .ext_image_copy_capture else .wlr_screencopy;

@@ -34,14 +34,15 @@ pub const Clipboard = struct {
         _ = wl.c.wl_display_flush(self.display);
 
         // Fork: parent returns, child serves paste requests
-        const pid = try posix.fork();
+        const pid = std.c.fork();
+        if (pid < 0) return error.ForkFailed;
         if (pid != 0) {
             // Parent returns immediately
             return;
         }
 
         // Child: detach from terminal, serve clipboard
-        _ = posix.setsid() catch {};
+        _ = std.c.setsid();
 
         while (!state.cancelled) {
             if (wl.c.wl_display_dispatch(self.display) == -1) break;
@@ -49,7 +50,7 @@ pub const Clipboard = struct {
 
         wl.c.ext_data_control_source_v1_destroy(data_source);
         wl.c.ext_data_control_device_v1_destroy(data_device);
-        posix.exit(0);
+        std.c.exit(0);
     }
 };
 
@@ -64,11 +65,12 @@ fn dataSourceSend(userdata: ?*anyopaque, _: ?*wl.c.ext_data_control_source_v1, _
     const state: *ServeState = @ptrCast(@alignCast(userdata));
     var written: usize = 0;
     while (written < state.data.len) {
-        const n = posix.write(fd, state.data[written..]) catch break;
-        if (n == 0) break;
-        written += n;
+        const remaining = state.data[written..];
+        const n = std.c.write(fd, remaining.ptr, remaining.len);
+        if (n <= 0) break;
+        written += @intCast(n);
     }
-    posix.close(fd);
+    _ = std.c.close(fd);
 }
 
 fn dataSourceCancelled(userdata: ?*anyopaque, _: ?*wl.c.ext_data_control_source_v1) callconv(.c) void {
