@@ -4,6 +4,7 @@ const wl = @import("wayland.zig");
 const ShmBuffer = @import("shm.zig").ShmBuffer;
 const Image = @import("image.zig").Image;
 const Rect = @import("image.zig").Rect;
+const state_io = @import("state.zig");
 
 /// State for the fullscreen selection overlay.
 pub const Overlay = struct {
@@ -85,6 +86,11 @@ pub const Overlay = struct {
     selection: ?Rect = null,
     action: Action = .none,
     done: bool = false,
+
+    // Persistence: write the latest selection to disk after each drag/move/resize
+    // so a subsequent run can restore it, even if the user cancels this one.
+    io: std.Io = undefined,
+    env: std.process.Environ = undefined,
 
     pub const Action = enum {
         none,
@@ -940,6 +946,12 @@ pub const Overlay = struct {
         }
     }
 
+    fn persistSelection(self: *const Overlay) void {
+        const sel = self.selection orelse return;
+        if (sel.isEmpty()) return;
+        state_io.saveLastRect(sel, self.io, self.env);
+    }
+
     pub const Result = struct {
         selection: ?Rect,
         action: Action,
@@ -1206,6 +1218,7 @@ fn pointerButton(data: ?*anyopaque, _: ?*wl.c.wl_pointer, _: u32, _: u32, button
                 self.hovered_button = self.hitTestToolbar(self.current_x, self.current_y);
                 self.renderToBuffer();
                 self.commitBuffer();
+                self.persistSelection();
             } else if (self.moving) {
                 self.moving = false;
                 // Selection already updated during motion
@@ -1219,6 +1232,7 @@ fn pointerButton(data: ?*anyopaque, _: ?*wl.c.wl_pointer, _: u32, _: u32, button
                 self.hovered_button = self.hitTestToolbar(self.current_x, self.current_y);
                 self.renderToBuffer();
                 self.commitBuffer();
+                self.persistSelection();
             } else if (self.selecting) {
                 self.selecting = false;
                 const sel = Rect.fromPoints(
@@ -1237,6 +1251,7 @@ fn pointerButton(data: ?*anyopaque, _: ?*wl.c.wl_pointer, _: u32, _: u32, button
                 // Redraw to show final selection state with toolbar
                 self.renderToBuffer();
                 self.commitBuffer();
+                self.persistSelection();
             }
         }
     }

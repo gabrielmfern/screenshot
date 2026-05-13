@@ -375,6 +375,8 @@ pub fn main(init: std.process.Init) !void {
             .screenshot = &screenshot,
             .selection = state.loadLastRect(allocator, io, env),
             .viewporter = viewporter,
+            .io = io,
+            .env = env,
         };
         try overlay.init(allocator);
 
@@ -393,7 +395,6 @@ pub fn main(init: std.process.Init) !void {
 
         if (result.selection) |sel| {
             overlay_selection = sel;
-            state.saveLastRect(sel, io, env);
             const mapped_sel = mapRectBetweenSpaces(
                 sel,
                 result.surface_width,
