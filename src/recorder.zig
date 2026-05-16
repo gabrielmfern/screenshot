@@ -268,14 +268,11 @@ pub const Recorder = struct {
         // ── Allocate packet ─────────────────────────────────────────────
         self.pkt = av.av_packet_alloc() orelse return error.EncoderInitFailed;
 
-        // ── swscale context: RGBA → YUV420P ─────────────────────────────
-        // Wayland compositors deliver pixels in RGBA byte order for
-        // WL_SHM_FORMAT_ARGB8888 / XRGB8888 (see image.zig:savePng for the
-        // observed behavior).
+        // ── swscale context: BGRA → YUV420P ─────────────────────────────
         self.sws_ctx = av.sws_getContext(
             @intCast(region.width),
             @intCast(region.height),
-            av.AV_PIX_FMT_RGBA,
+            av.AV_PIX_FMT_BGRA,
             w,
             h,
             av.AV_PIX_FMT_YUV420P,

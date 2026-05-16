@@ -46,16 +46,16 @@ pub const Rect = struct {
     }
 };
 
-/// A 32-bit per pixel RGBA image, in the byte order compositors deliver
-/// when we request WL_SHM_FORMAT_ARGB8888 / XRGB8888 (byte 0 = R, byte 1 = G,
-/// byte 2 = B, byte 3 = A).
+/// An BGRA8888 pixel buffer (the format Wayland compositors typically use for SHM).
 pub const Image = struct {
+    /// Raw pixel data in BGRA format (4 bytes per pixel).
     data: []u8,
     width: u32,
     height: u32,
     stride: u32,
     allocator: std.mem.Allocator,
 
+    /// Bytes per pixel (BGRA = 4).
     pub const bpp = 4;
 
     /// Create an image that wraps externally-owned data (e.g. a Wayland SHM buffer).
@@ -97,13 +97,26 @@ pub const Image = struct {
         };
     }
 
+    /// Convert BGRA pixels to RGBA in-place (swaps B and R channels).
+    /// This is needed because PNG expects RGBA but Wayland SHM gives us BGRA.
+    pub fn bgraToRgba(self: *Image) void {
+        var offset: usize = 0;
+        const total = @as(usize, self.height) * self.stride;
+        while (offset + 3 < total) : (offset += bpp) {
+            const b = self.data[offset + 0];
+            const r = self.data[offset + 2];
+            self.data[offset + 0] = r;
+            self.data[offset + 2] = b;
+        }
+    }
+
     /// Save this image as a PNG file.
+    /// Converts BGRA to RGBA before writing.
     pub fn savePng(self: *Image, path: [*:0]const u8) !void {
-        // Compositors tested (Hyprland, presumably others using ext-image-copy-
-        // capture-v1) deliver pixels in RGBA byte order for WL_SHM_FORMAT_ARGB8888
-        // / XRGB8888, despite the Wayland spec describing those formats as
-        // little-endian packed (which would be BGRA bytes). Empirically the bytes
-        // are already in the order stb expects, so don't swap.
+        // Convert BGRA -> RGBA in-place for PNG encoding
+        self.bgraToRgba();
+        defer self.bgraToRgba(); // convert back
+
         const result = c.stbi_write_png(
             path,
             @intCast(self.width),
@@ -251,6 +264,40 @@ test "Image.crop empty region returns error" {
 
     // Region entirely outside bounds
     try std.testing.expectError(error.EmptyCropRegion, img.crop(allocator, .{ .x = 100, .y = 100, .width = 10, .height = 10 }));
+}
+
+test "Image.bgraToRgba swaps channels correctly" {
+    const allocator = std.testing.allocator;
+    var data = try allocator.alloc(u8, Image.bpp);
+    defer allocator.free(data);
+
+    // BGRA: B=0x10, G=0x20, R=0x30, A=0x40
+    data[0] = 0x10;
+    data[1] = 0x20;
+    data[2] = 0x30;
+    data[3] = 0x40;
+
+    var img = Image{
+        .data = data,
+        .width = 1,
+        .height = 1,
+        .stride = Image.bpp,
+        .allocator = undefined,
+    };
+
+    img.bgraToRgba();
+    // After conversion: RGBA: R=0x30, G=0x20, B=0x10, A=0x40
+    try std.testing.expectEqual(@as(u8, 0x30), data[0]); // R (was B position)
+    try std.testing.expectEqual(@as(u8, 0x20), data[1]); // G (unchanged)
+    try std.testing.expectEqual(@as(u8, 0x10), data[2]); // B (was R position)
+    try std.testing.expectEqual(@as(u8, 0x40), data[3]); // A (unchanged)
+
+    // Convert back
+    img.bgraToRgba();
+    try std.testing.expectEqual(@as(u8, 0x10), data[0]); // B restored
+    try std.testing.expectEqual(@as(u8, 0x20), data[1]); // G unchanged
+    try std.testing.expectEqual(@as(u8, 0x30), data[2]); // R restored
+    try std.testing.expectEqual(@as(u8, 0x40), data[3]); // A unchanged
 }
 
 test "Image.savePng writes a valid file" {
