@@ -11,6 +11,7 @@ const RecordingOverlay = @import("recording_overlay.zig").RecordingOverlay;
 const Clipboard = @import("clipboard.zig").Clipboard;
 const Audio = @import("audio.zig").Audio;
 const state = @import("state.zig");
+const single_instance = @import("single_instance.zig");
 
 // ── Timer ────────────────────────────────────────────────────────────────────
 
@@ -298,6 +299,16 @@ pub fn main(init: std.process.Init) !void {
             return;
         }
     }
+
+    // Refuse to launch if another instance is already running. The kernel
+    // releases the flock when this process exits, so no cleanup is needed.
+    single_instance.acquire(env) catch |err| switch (err) {
+        error.AlreadyRunning => {
+            std.log.err("screenshot is already running", .{});
+            return;
+        },
+        error.LockSetupFailed => std.log.warn("could not acquire single-instance lock; continuing", .{}),
+    };
 
     // Connect to Wayland
     wl_display = wl.c.wl_display_connect(null) orelse {
