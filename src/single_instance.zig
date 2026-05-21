@@ -9,9 +9,11 @@ pub const Error = error{
 
 /// Acquires a process-wide exclusive lock on a file in $XDG_RUNTIME_DIR
 /// (falling back to /tmp). Returns `error.AlreadyRunning` if another
-/// instance already holds the lock. The fd is intentionally leaked: the
-/// kernel releases the flock when the process exits.
-pub fn acquire(env: std.process.Environ) Error!void {
+/// instance already holds the lock. The kernel releases the flock when
+/// the process (and every fork()'d descendant holding the fd) exits, so
+/// children that outlive the parent must explicitly call `releaseInChild`
+/// — otherwise the lock survives in the daemon and blocks new instances.
+pub fn acquire(env: std.process.Environ) Error!i32 {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = buildLockPath(&path_buf, env) catch return error.LockSetupFailed;
 
@@ -24,11 +26,20 @@ pub fn acquire(env: std.process.Environ) Error!void {
 
     const rc = linux.flock(fd, posix.LOCK.EX | posix.LOCK.NB);
     const signed: isize = @bitCast(rc);
-    if (signed == 0) return; // success
+    if (signed == 0) return fd; // success
     _ = std.c.close(fd);
     // Linux encodes -errno in the syscall return. EAGAIN/EWOULDBLOCK = 11.
     if (signed == -11) return error.AlreadyRunning;
     return error.LockSetupFailed;
+}
+
+/// Release the single-instance lock from a forked child that intends to
+/// outlive the parent. Closing the inherited fd drops this process's
+/// reference to the open file description; once the parent exits too,
+/// the flock is gone and new instances can launch.
+pub fn releaseInChild(fd: i32) void {
+    _ = linux.flock(fd, posix.LOCK.UN);
+    _ = std.c.close(fd);
 }
 
 fn buildLockPath(buf: []u8, env: std.process.Environ) ![:0]const u8 {

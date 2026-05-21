@@ -1,6 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
 const wl = @import("wayland.zig");
+const single_instance = @import("single_instance.zig");
 
 /// Native Wayland clipboard using ext-data-control-v1.
 ///
@@ -11,6 +12,10 @@ pub const Clipboard = struct {
     data_control_manager: *wl.c.ext_data_control_manager_v1,
     seat: *wl.c.wl_seat,
     display: *wl.c.wl_display,
+    /// fd of the single-instance flock, if any. The forked child must
+    /// release it — otherwise the daemon keeps the lock alive and blocks
+    /// new screenshot invocations until the clipboard is replaced.
+    lock_fd: ?i32 = null,
 
     /// Copy data to the clipboard. Forks a background process that serves
     /// paste requests until another app claims the selection.
@@ -43,6 +48,10 @@ pub const Clipboard = struct {
 
         // Child: detach from terminal, serve clipboard
         _ = std.c.setsid();
+
+        // Release the inherited single-instance flock so new screenshot
+        // invocations aren't blocked while this clipboard daemon lives on.
+        if (self.lock_fd) |fd| single_instance.releaseInChild(fd);
 
         while (!state.cancelled) {
             if (wl.c.wl_display_dispatch(self.display) == -1) break;

@@ -44,6 +44,10 @@ var screencopy_manager: ?*wl.c.zwlr_screencopy_manager_v1 = null;
 var data_control_manager: ?*wl.c.ext_data_control_manager_v1 = null;
 var viewporter: ?*wl.c.wp_viewporter = null;
 
+// fd of the single-instance lock, threaded to the clipboard daemon so it
+// can release the inherited flock after fork.
+var single_instance_fd: ?i32 = null;
+
 // ── Registry listener ───────────────────────────────────────────────────────
 
 fn BindingInfo(T: type) type {
@@ -214,6 +218,7 @@ fn copyDataToClipboard(mime_type: [*:0]const u8, data: []const u8) !void {
         .data_control_manager = data_control_manager orelse return error.MissingDataControlManager,
         .seat = wl_seat orelse return error.MissingSeat,
         .display = wl_display orelse return error.NoWaylandDisplay,
+        .lock_fd = single_instance_fd,
     };
     try clipboard.copy(mime_type, data);
 }
@@ -300,15 +305,18 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    // Refuse to launch if another instance is already running. The kernel
-    // releases the flock when this process exits, so no cleanup is needed.
-    single_instance.acquire(env) catch |err| switch (err) {
+    // Refuse to launch if another instance is already running. The fd is
+    // stashed so a forked clipboard daemon can release the flock — without
+    // that, the daemon keeps the lock and blocks future invocations.
+    if (single_instance.acquire(env)) |fd| {
+        single_instance_fd = fd;
+    } else |err| switch (err) {
         error.AlreadyRunning => {
             std.log.err("screenshot is already running", .{});
             return;
         },
         error.LockSetupFailed => std.log.warn("could not acquire single-instance lock; continuing", .{}),
-    };
+    }
 
     // Connect to Wayland
     wl_display = wl.c.wl_display_connect(null) orelse {
